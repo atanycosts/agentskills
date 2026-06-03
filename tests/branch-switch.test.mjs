@@ -41,26 +41,48 @@ function createBranchSwitchFixture() {
   }
 }
 
+test('switch-branch defaults to npm.cmd on Windows when no override is provided', () => {
+  if (process.platform !== 'win32') return
+  const { root: pkgRoot } = createPackageFixture()
+  const home = createHomeFixture()
+  const binDir = createTempDir('helloagents-branch-bin-default-')
+  const npmLog = join(home, 'npm-default.log')
+  const npmCmdPath = writeFakeCommand(binDir, 'npm', npmLog)
+  const env = {
+    PATH: `${binDir};${process.env.PATH || process.env.Path || ''}`,
+    Path: `${binDir};${process.env.PATH || process.env.Path || ''}`,
+  }
+
+  const result = runCli(pkgRoot, home, ['switch-branch', 'beta', 'codex', '--standby'], env)
+  assert.doesNotMatch(result.stderr || '', /DEP0190/)
+
+  assert.equal(npmCmdPath.endsWith('npm.cmd'), true)
+  assert.match(readText(npmLog), /install -g https:\/\/github\.com\/hellowind777\/helloagents\/archive\/refs\/heads\/beta\.tar\.gz/)
+  assert.match(readText(npmLog), /explore -g helloagents -- npm run sync-hosts -- codex --standby/)
+})
+
 test('switch-branch installs a GitHub branch and refreshes a scoped global host through npm', () => {
   const { pkgRoot, home, env, npmLog } = createBranchSwitchFixture()
 
-  runCli(pkgRoot, home, ['switch-branch', 'beta', 'claude', '--global'], env)
+  const result = runCli(pkgRoot, home, ['switch-branch', 'beta', 'claude', '--global'], env)
+  assert.doesNotMatch(result.stderr || '', /DEP0190/)
 
-  assert.match(readText(npmLog), /install -g github:hellowind777\/helloagents#beta/)
+  assert.match(readText(npmLog), /install -g https:\/\/github\.com\/hellowind777\/helloagents\/archive\/refs\/heads\/beta\.tar\.gz/)
   assert.match(readText(npmLog), /explore -g helloagents -- npm run sync-hosts -- claude --global/)
 })
 
 test('branch accepts a full npm spec and refreshes all hosts through npm', () => {
   const { pkgRoot, home, env, npmLog } = createBranchSwitchFixture()
 
-  runCli(pkgRoot, home, [
+  const result = runCli(pkgRoot, home, [
     'branch',
-    'github:hellowind777/helloagents#beta',
+    'https://github.com/hellowind777/helloagents/archive/refs/heads/beta.tar.gz',
     '--all',
     '--standby',
   ], env)
+  assert.doesNotMatch(result.stderr || '', /DEP0190/)
 
-  assert.match(readText(npmLog), /install -g github:hellowind777\/helloagents#beta/)
+  assert.match(readText(npmLog), /install -g https:\/\/github\.com\/hellowind777\/helloagents\/archive\/refs\/heads\/beta\.tar\.gz/)
   assert.match(readText(npmLog), /explore -g helloagents -- npm run sync-hosts -- --all --standby/)
 })
 
@@ -87,4 +109,14 @@ test('package exposes npm-script and one-shot script entry points', () => {
   assert.match(readText(join(REPO_ROOT, 'install.ps1')), /HELLOAGENTS_ACTION/)
   assert.match(readText(join(REPO_ROOT, 'install.ps1')), /install\|update\|cleanup\|uninstall\|switch-branch\|branch/)
   assert.match(readText(join(REPO_ROOT, 'install.ps1')), /HELLOAGENTS=all\|claude\|gemini\|codex/)
+})
+
+test('one-shot shell wrappers preserve mode omission for update and cleanup flows', () => {
+  const installSh = readText(join(REPO_ROOT, 'install.sh'))
+  const installPs1 = readText(join(REPO_ROOT, 'install.ps1'))
+
+  assert.match(installSh, /export HELLOAGENTS_MODE="\$\{MODE:-standby\}"/)
+  assert.match(installSh, /if \[ -n "\$MODE" \]; then\s+npm explore -g helloagents -- npm run sync-hosts -- "\$TARGET" "--\$MODE"\s+else\s+npm explore -g helloagents -- npm run sync-hosts -- "\$TARGET"/s)
+  assert.match(installPs1, /if \(\$Mode\) \{\s*\$env:HELLOAGENTS_MODE = \$Mode\s*\}\s*else \{\s*\$env:HELLOAGENTS_MODE = "standby"/s)
+  assert.doesNotMatch(installPs1, /\$Mode = "standby"/)
 })

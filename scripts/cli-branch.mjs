@@ -1,15 +1,12 @@
-import { spawnSync } from 'node:child_process'
-
 import { normalizeHost } from './cli-lifecycle.mjs'
+import { spawnCommandSync } from './cli-process.mjs'
 
-const DEFAULT_REPO_SPEC = 'github:hellowind777/helloagents'
+const DEFAULT_REPO_ARCHIVE_BASE = 'https://github.com/hellowind777/helloagents/archive/refs/heads'
 
 function runCommand(command, args) {
-  const needsShell = process.platform === 'win32' && /\.cmd$/i.test(command)
-  const result = spawnSync(command, args, {
+  const result = spawnCommandSync(command, args, {
     encoding: 'utf-8',
     errors: 'replace',
-    shell: needsShell,
     stdio: 'inherit',
     windowsHide: true,
   })
@@ -17,6 +14,10 @@ function runCommand(command, args) {
   if (result.status !== 0) {
     throw new Error(`${command} ${args.join(' ')} 执行失败，退出码 ${result.status}`)
   }
+}
+
+function getDefaultNpmCommand() {
+  return process.platform === 'win32' ? 'npm.cmd' : 'npm'
 }
 
 function parseModeFlag(args) {
@@ -56,7 +57,7 @@ function parseBranchArgs(args) {
 
 function buildPackageSpec(ref) {
   if (/^(github:|git\+|https?:|file:)/i.test(ref)) return ref
-  return `${DEFAULT_REPO_SPEC}#${ref}`
+  return `${DEFAULT_REPO_ARCHIVE_BASE}/${ref}.tar.gz`
 }
 
 function buildSyncArgs({ host, mode }) {
@@ -76,7 +77,7 @@ function buildSyncArgs({ host, mode }) {
 
 export function runBranchSwitch(args, options = {}) {
   const parsed = parseBranchArgs(args)
-  const npmCommand = options.npmCommand || process.env.HELLOAGENTS_NPM_CMD || 'npm'
+  const npmCommand = options.npmCommand || process.env.HELLOAGENTS_NPM_CMD || getDefaultNpmCommand()
 
   const packageSpec = buildPackageSpec(parsed.branch)
   runCommand(npmCommand, ['install', '-g', packageSpec])

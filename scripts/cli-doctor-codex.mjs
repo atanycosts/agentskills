@@ -1,16 +1,22 @@
 import { existsSync, realpathSync } from 'node:fs'
+import { platform } from 'node:os'
 import { join } from 'node:path'
 
 import { CODEX_MARKETPLACE_NAME, CODEX_PLUGIN_CONFIG_HEADER, CODEX_PLUGIN_NAME } from './cli-codex.mjs'
 import {
+  analyzeCodexNotifyBlock,
   CODEX_MANAGED_MODEL_INSTRUCTIONS_PATH,
-  CODEX_MANAGED_NOTIFY_VALUE,
   readCodexGoalsFeatureLine,
   readCodexHooksFeatureLine,
-  readLegacyCodexHooksFeatureLine,
 } from './cli-codex-config.mjs'
+import {
+  buildManagedCodexHookTrustEntries,
+  readCodexHookStateSections,
+} from './cli-codex-hooks-state.mjs'
+import { getStableRuntimeRoot } from './cli-runtime-root.mjs'
 import { buildRuntimeCarrier } from './cli-runtime-carrier.mjs'
-import { readTopLevelTomlLine } from './cli-toml.mjs'
+import { readTopLevelTomlBlock, readTopLevelTomlLine } from './cli-toml.mjs'
+import { spawnCommandSync } from './cli-process.mjs'
 import { loadHooksWithCliEntry, safeJson, safeRead } from './cli-utils.mjs'
 
 function safeRealTarget(linkPath) {
@@ -59,15 +65,151 @@ function readExpectedHooks(runtime, hooksFile, pathVar) {
   return pickManagedHooks(loadHooksWithCliEntry(runtime.pkgRoot, hooksFile, pathVar)?.hooks || {})
 }
 
-function readExpectedCarrierContent(runtime, fileName, settings) {
+function readExpectedCarrierContent(runtime, fileName, settings, options = {}) {
   const bootstrap = safeRead(join(runtime.pkgRoot, fileName)) || ''
-  return normalizeText(buildRuntimeCarrier(bootstrap, settings))
+  return normalizeText(buildRuntimeCarrier(bootstrap, settings, options))
 }
 
 function buildDoctorIssue(runtime, code, cn, en) {
   return {
     code,
     message: runtime.msg(cn, en),
+  }
+}
+
+function normalizeDoctorText(value = '') {
+  return String(value || '').replace(/\s+/g, ' ').trim()
+}
+
+function readFirstInteger(value = '') {
+  const match = String(value || '').match(/-?\d+/)
+  return match ? Number.parseInt(match[0], 10) : null
+}
+
+function readNativeDoctorDetail(checks, checkId, detailKey) {
+  return String(checks?.[checkId]?.details?.[detailKey] || '').trim()
+}
+
+function readNativeDoctorList(value = '') {
+  const normalized = normalizeDoctorText(value)
+  if (!normalized || normalized === '(none)') return []
+  return normalized.split(/\s*,\s*/).map((entry) => entry.trim()).filter(Boolean)
+}
+
+function summarizeNativeCodexDoctor(payload = {}) {
+  const checks = payload?.checks || {}
+  const configCheck = checks['config.load'] || {}
+  const sandboxCheck = checks['sandbox.helpers'] || {}
+  const mcpCount = readFirstInteger(readNativeDoctorDetail(checks, 'config.load', 'mcp servers'))
+  const fsSandbox = readNativeDoctorDetail(checks, 'sandbox.helpers', 'filesystem sandbox').toLowerCase()
+  const linuxHelper = readNativeDoctorDetail(checks, 'sandbox.helpers', 'codex-linux-sandbox helper').toLowerCase()
+    || readNativeDoctorDetail(checks, 'sandbox.helpers', 'linux helper').toLowerCase()
+  const execveHelper = readNativeDoctorDetail(checks, 'sandbox.helpers', 'execve wrapper helper').toLowerCase()
+
+  let sandboxAvailable = null
+  if (sandboxCheck && Object.keys(sandboxCheck).length > 0) {
+    sandboxAvailable = Boolean(
+      (fsSandbox && !fsSandbox.includes('unrestricted'))
+      || (linuxHelper && linuxHelper !== 'none')
+      || (execveHelper && execveHelper !== 'none')
+    )
+  }
+
+  return {
+    version: String(payload?.codexVersion || '').trim(),
+    configPath: readNativeDoctorDetail(checks, 'config.load', 'config.toml'),
+    resolvedProvider: readNativeDoctorDetail(checks, 'config.load', 'model provider'),
+    resolvedModel: readNativeDoctorDetail(checks, 'config.load', 'model'),
+    sandboxAvailable,
+    mcpPresent: typeof mcpCount === 'number' ? mcpCount > 0 : false,
+    skillsSelected: readNativeDoctorList(
+      readNativeDoctorDetail(checks, 'config.load', 'selected skills')
+      || readNativeDoctorDetail(checks, 'config.load', 'skills selected')
+    ),
+  }
+}
+
+function summarizeNativeCodexDoctorOutput(payload = {}) {
+  const checks = Object.values(payload?.checks || {})
+  const failedCheck = checks.find((check) => check?.status === 'fail')
+  if (failedCheck?.issues?.length) {
+    return normalizeDoctorText(failedCheck.issues.map((issue) => issue?.cause || issue?.measured || '').filter(Boolean).join(' | '))
+  }
+  if (failedCheck?.summary) return normalizeDoctorText(failedCheck.summary)
+
+  const warningCheck = checks.find((check) => check?.status === 'warn')
+  if (warningCheck?.issues?.length) {
+    return normalizeDoctorText(warningCheck.issues.map((issue) => issue?.cause || issue?.measured || '').filter(Boolean).join(' | '))
+  }
+  if (warningCheck?.summary) return normalizeDoctorText(warningCheck.summary)
+
+  return ''
+}
+
+function inspectNativeCodexDoctor(runtime) {
+  const command = platform() === 'win32' ? 'codex.cmd' : 'codex'
+  try {
+    const result = spawnCommandSync(command, ['doctor', '--json'], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        HOME: runtime.home || process.env.HOME,
+        USERPROFILE: runtime.home || process.env.USERPROFILE,
+        NO_COLOR: process.env.NO_COLOR || '1',
+      },
+      encoding: 'utf-8',
+      timeout: 20_000,
+      windowsHide: true,
+    })
+
+    if (result.error) {
+      return {
+        available: false,
+        ok: false,
+        status: '',
+        summary: null,
+        output: normalizeDoctorText(result.error.message || ''),
+      }
+    }
+
+    const stdout = String(result.stdout || '').trim()
+    if (!stdout) {
+      return {
+        available: true,
+        ok: result.status === 0,
+        status: '',
+        summary: null,
+        output: normalizeDoctorText(result.stderr || ''),
+      }
+    }
+
+    try {
+      const payload = JSON.parse(stdout)
+      const status = String(payload?.overallStatus || '').trim().toLowerCase()
+      return {
+        available: true,
+        ok: status ? status !== 'fail' : result.status === 0,
+        status,
+        summary: summarizeNativeCodexDoctor(payload),
+        output: summarizeNativeCodexDoctorOutput(payload),
+      }
+    } catch {
+      return {
+        available: true,
+        ok: result.status === 0,
+        status: '',
+        summary: null,
+        output: normalizeDoctorText(stdout || result.stderr || ''),
+      }
+    }
+  } catch (error) {
+    return {
+      available: false,
+      ok: false,
+      status: '',
+      summary: null,
+      output: normalizeDoctorText(error?.message || ''),
+    }
   }
 }
 
@@ -92,7 +234,7 @@ function suggestCodexDoctorFix(status, trackedMode) {
 
 function appendCodexStandbyIssues(runtime, issues, checks) {
   if (!checks.carrierMarker) issues.push(buildDoctorIssue(runtime, 'standby-carrier-missing', 'standby `~/.codex/AGENTS.md` 缺少 HelloAGENTS 标记', 'Standby `~/.codex/AGENTS.md` is missing the HELLOAGENTS marker'))
-  if (checks.carrierMarker && !checks.carrierContentMatch) issues.push(buildDoctorIssue(runtime, 'standby-carrier-drift', 'standby `~/.codex/AGENTS.md` 与当前 bootstrap-lite.md 不一致', 'Standby `~/.codex/AGENTS.md` differs from the current bootstrap-lite.md'))
+  if (checks.carrierMarker && !checks.carrierContentMatch) issues.push(buildDoctorIssue(runtime, 'standby-carrier-drift', 'standby `~/.codex/AGENTS.md` 与当前标准模式规则不一致', 'Standby `~/.codex/AGENTS.md` differs from the current standby rules'))
   if (!checks.homeLink) issues.push(buildDoctorIssue(runtime, 'standby-link-missing', 'standby `~/.codex/helloagents` 链接缺失或未指向稳定运行根目录', 'Standby `~/.codex/helloagents` link is missing or points to a different runtime root'))
   if (!checks.modelInstructionsFile) issues.push(buildDoctorIssue(runtime, 'standby-model-instructions-missing', 'standby config 缺少受管 model_instructions_file', 'Standby config is missing the managed model_instructions_file'))
   if (checks.modelInstructionsFile && !checks.modelInstructionsPathMatch) issues.push(buildDoctorIssue(runtime, 'standby-model-instructions-drift', 'standby model_instructions_file 未指向受管 `~/.codex/AGENTS.md`', 'Standby model_instructions_file does not point to the managed `~/.codex/AGENTS.md`'))
@@ -101,6 +243,8 @@ function appendCodexStandbyIssues(runtime, issues, checks) {
   if (!checks.codexHooksFeature) issues.push(buildDoctorIssue(runtime, 'codex-hooks-feature-disabled', 'Codex hooks 功能被显式关闭', 'Codex hooks feature is explicitly disabled'))
   if (!checks.standaloneHooks) issues.push(buildDoctorIssue(runtime, 'standby-hooks-missing', 'standby `~/.codex/hooks.json` 缺少 HelloAGENTS hooks', 'Standby `~/.codex/hooks.json` is missing HelloAGENTS hooks'))
   if (checks.standaloneHooks && !checks.standaloneHooksMatch) issues.push(buildDoctorIssue(runtime, 'standby-hooks-drift', 'standby `~/.codex/hooks.json` 与当前 hooks-codex.json 不一致', 'Standby `~/.codex/hooks.json` differs from the current hooks-codex.json'))
+  if (checks.standaloneHooks && !checks.managedHookTrust) issues.push(buildDoctorIssue(runtime, 'standby-hook-trust-missing', 'standby `config.toml` 缺少 HelloAGENTS hooks trust 本机状态', 'Standby `config.toml` is missing HelloAGENTS machine-local hook trust metadata'))
+  if (checks.standaloneHooks && checks.managedHookTrust && !checks.managedHookTrustMatch) issues.push(buildDoctorIssue(runtime, 'standby-hook-trust-drift', 'standby hooks trust 本机状态与当前 hooks 定义或本机路径不一致', 'Standby machine-local hook trust metadata differs from the current hooks definition or local path'))
   if (checks.pluginRoot || checks.pluginCache || checks.marketplaceEntry || checks.pluginEnabled) {
     issues.push(buildDoctorIssue(runtime, 'standby-global-residue', 'standby 模式下仍残留 global 插件文件或配置', 'Global plugin artifacts still remain while Codex is in standby mode'))
   }
@@ -108,12 +252,16 @@ function appendCodexStandbyIssues(runtime, issues, checks) {
 
 function appendCodexGlobalIssues(runtime, issues, checks, pluginVersion, cacheVersion) {
   if (!checks.carrierMarker) issues.push(buildDoctorIssue(runtime, 'global-home-carrier-missing', 'global `~/.codex/AGENTS.md` 缺少 HelloAGENTS 规则内容', 'Global `~/.codex/AGENTS.md` is missing the HelloAGENTS carrier'))
-  if (checks.carrierMarker && !checks.carrierContentMatch) issues.push(buildDoctorIssue(runtime, 'global-home-carrier-drift', 'global `~/.codex/AGENTS.md` 与当前 bootstrap.md 不一致', 'Global `~/.codex/AGENTS.md` differs from the current bootstrap.md'))
-  if (!checks.globalHomeLink) issues.push(buildDoctorIssue(runtime, 'global-read-root-link-missing', 'global `~/.codex/helloagents` 链接缺失或未指向当前插件根目录', 'Global `~/.codex/helloagents` link is missing or does not point to the current plugin root'))
+  if (checks.carrierMarker && !checks.carrierContentMatch) issues.push(buildDoctorIssue(runtime, 'global-home-carrier-drift', 'global `~/.codex/AGENTS.md` 与当前全局模式规则不一致', 'Global `~/.codex/AGENTS.md` differs from the current global rules'))
+  if (!checks.globalHomeLink) issues.push(buildDoctorIssue(runtime, 'global-read-root-link-missing', 'global `~/.codex/helloagents` 链接缺失或未指向稳定运行根目录', 'Global `~/.codex/helloagents` link is missing or does not point to the stable runtime root'))
   if (!checks.pluginRoot) issues.push(buildDoctorIssue(runtime, 'global-plugin-root-missing', 'global 插件根目录缺失', 'Global plugin root is missing'))
   if (!checks.pluginCache) issues.push(buildDoctorIssue(runtime, 'global-plugin-cache-missing', 'global 插件缓存目录缺失', 'Global plugin cache directory is missing'))
-  if (checks.pluginRoot && !checks.pluginCarrierMatch) issues.push(buildDoctorIssue(runtime, 'global-plugin-carrier-drift', 'global 插件根目录中的 AGENTS.md 与当前 bootstrap.md 不一致', 'Global plugin AGENTS.md differs from the current bootstrap.md'))
-  if (checks.pluginCache && !checks.pluginCacheCarrierMatch) issues.push(buildDoctorIssue(runtime, 'global-plugin-cache-carrier-drift', 'global 插件缓存中的 AGENTS.md 与当前 bootstrap.md 不一致', 'Global plugin cache AGENTS.md differs from the current bootstrap.md'))
+  if (checks.pluginRoot && !checks.pluginRootLink) issues.push(buildDoctorIssue(runtime, 'global-plugin-root-link-drift', 'global 插件根目录未链接到稳定运行根目录', 'Global plugin root does not link to the stable runtime root'))
+  if (checks.pluginCache && !checks.pluginCacheLink) issues.push(buildDoctorIssue(runtime, 'global-plugin-cache-link-drift', 'global 插件缓存未链接到稳定运行根目录', 'Global plugin cache does not link to the stable runtime root'))
+  if (checks.pluginGenericHooks) issues.push(buildDoctorIssue(runtime, 'global-plugin-generic-hooks-present', 'global 插件根目录中意外存在通用 `hooks/hooks.json`，可能污染 Codex 本地插件 hook 加载', 'Global plugin root unexpectedly contains a generic `hooks/hooks.json`, which can pollute Codex local-plugin hook loading'))
+  if (checks.pluginCacheGenericHooks) issues.push(buildDoctorIssue(runtime, 'global-plugin-cache-generic-hooks-present', 'global 插件缓存中意外存在通用 `hooks/hooks.json`，可能污染 Codex 本地插件 hook 加载', 'Global plugin cache unexpectedly contains a generic `hooks/hooks.json`, which can pollute Codex local-plugin hook loading'))
+  if (checks.pluginRoot && !checks.pluginCarrierMatch) issues.push(buildDoctorIssue(runtime, 'global-plugin-carrier-drift', 'global 插件根目录中的 AGENTS.md 与当前全局模式规则不一致', 'Global plugin AGENTS.md differs from the current global rules'))
+  if (checks.pluginCache && !checks.pluginCacheCarrierMatch) issues.push(buildDoctorIssue(runtime, 'global-plugin-cache-carrier-drift', 'global 插件缓存中的 AGENTS.md 与当前全局模式规则不一致', 'Global plugin cache AGENTS.md differs from the current global rules'))
   if (!checks.marketplaceEntry) issues.push(buildDoctorIssue(runtime, 'global-marketplace-missing', 'global marketplace 条目缺失', 'Global marketplace entry is missing'))
   if (!checks.pluginEnabled) issues.push(buildDoctorIssue(runtime, 'global-plugin-disabled', 'global config 中缺少插件启用段', 'Global plugin enablement block is missing from config'))
   if (!checks.modelInstructionsFile) issues.push(buildDoctorIssue(runtime, 'global-model-instructions-missing', 'global config 缺少受管 model_instructions_file', 'Global config is missing the managed model_instructions_file'))
@@ -123,9 +271,10 @@ function appendCodexGlobalIssues(runtime, issues, checks, pluginVersion, cacheVe
   if (!checks.codexHooksFeature) issues.push(buildDoctorIssue(runtime, 'codex-hooks-feature-disabled', 'Codex hooks 功能被显式关闭', 'Codex hooks feature is explicitly disabled'))
   if (!checks.standaloneHooks) issues.push(buildDoctorIssue(runtime, 'global-hooks-missing', 'global `~/.codex/hooks.json` 缺少 HelloAGENTS hooks', 'Global `~/.codex/hooks.json` is missing HelloAGENTS hooks'))
   if (checks.standaloneHooks && !checks.standaloneHooksMatch) issues.push(buildDoctorIssue(runtime, 'global-hooks-drift', 'global `~/.codex/hooks.json` 与当前 hooks-codex.json 不一致', 'Global `~/.codex/hooks.json` differs from the current hooks-codex.json'))
+  if (checks.standaloneHooks && !checks.managedHookTrust) issues.push(buildDoctorIssue(runtime, 'global-hook-trust-missing', 'global `config.toml` 缺少 HelloAGENTS hooks trust 本机状态', 'Global `config.toml` is missing HelloAGENTS machine-local hook trust metadata'))
+  if (checks.standaloneHooks && checks.managedHookTrust && !checks.managedHookTrustMatch) issues.push(buildDoctorIssue(runtime, 'global-hook-trust-drift', 'global hooks trust 本机状态与当前 hooks 定义或本机路径不一致', 'Global machine-local hook trust metadata differs from the current hooks definition or local path'))
   if (pluginVersion && !checks.pluginVersionMatch) issues.push(buildDoctorIssue(runtime, 'global-plugin-version-drift', 'global 插件根目录版本与当前包版本不一致', 'Global plugin root version does not match the current package version'))
   if (cacheVersion && !checks.pluginCacheVersionMatch) issues.push(buildDoctorIssue(runtime, 'global-plugin-cache-version-drift', 'global 插件缓存版本与当前包版本不一致', 'Global plugin cache version does not match the current package version'))
-  if (checks.homeLink) issues.push(buildDoctorIssue(runtime, 'global-standby-link-residue', 'global 模式下仍残留 standby home 链接', 'Standby home link still remains while Codex is in global mode'))
 }
 
 function buildCodexChecks(runtime, settings, trackedMode, detectedMode) {
@@ -133,42 +282,63 @@ function buildCodexChecks(runtime, settings, trackedMode, detectedMode) {
   const codexConfig = safeRead(join(codexDir, 'config.toml')) || ''
   const pluginRoot = join(runtime.home, 'plugins', CODEX_PLUGIN_NAME)
   const pluginCacheRoot = join(codexDir, 'plugins', 'cache', CODEX_MARKETPLACE_NAME, CODEX_PLUGIN_NAME, 'local')
+  const runtimeRoot = safeRealTarget(getStableRuntimeRoot(runtime.home)) || normalizePath(getStableRuntimeRoot(runtime.home))
   const homeLinkTarget = safeRealTarget(join(codexDir, 'helloagents'))
+  const pluginRootTarget = safeRealTarget(pluginRoot)
+  const pluginCacheTarget = safeRealTarget(pluginCacheRoot)
+  const pluginGenericHooks = !!safeRead(join(pluginRoot, 'hooks', 'hooks.json'))
+  const pluginCacheGenericHooks = !!safeRead(join(pluginCacheRoot, 'hooks', 'hooks.json'))
   const expectedHomeCarrier = (detectedMode === 'global' || (detectedMode === 'none' && trackedMode === 'global'))
     ? 'bootstrap.md'
     : 'bootstrap-lite.md'
   const codexHooks = safeJson(join(codexDir, 'hooks.json')) || {}
   const marketplace = safeJson(join(runtime.home, '.agents', 'plugins', 'marketplace.json')) || {}
   const modelInstructionsLine = readTopLevelTomlLine(codexConfig, 'model_instructions_file')
+  const notifyBlock = readTopLevelTomlBlock(codexConfig, 'notify')
+  const notifyAnalysis = analyzeCodexNotifyBlock(notifyBlock)
   const expectedHooks = readExpectedHooks(runtime, 'hooks-codex.json', '${PLUGIN_ROOT}')
+  const expectedHookTrust = buildManagedCodexHookTrustEntries(join(codexDir, 'hooks.json'), codexHooks)
+  const managedHookTrust = new Map(
+    readCodexHookStateSections(codexConfig)
+      .filter((section) => section.managed)
+      .map((section) => [section.key, section.trustedHash]),
+  )
   const hooksFeatureLine = readCodexHooksFeatureLine(codexConfig)
   const goalsFeatureLine = readCodexGoalsFeatureLine(codexConfig)
-  const legacyHooksFeatureLine = readLegacyCodexHooksFeatureLine(codexConfig)
-
   return {
     checks: {
       carrierMarker: (safeRead(join(codexDir, 'AGENTS.md')) || '').includes('HELLOAGENTS_START'),
       carrierContentMatch: normalizeText((safeRead(join(codexDir, 'AGENTS.md')) || '').match(/<!-- HELLOAGENTS_START -->([\s\S]*?)<!-- HELLOAGENTS_END -->/)?.[1] || '')
-        === readExpectedCarrierContent(runtime, expectedHomeCarrier, settings),
+        === readExpectedCarrierContent(
+          runtime,
+          expectedHomeCarrier,
+          settings,
+          expectedHomeCarrier === 'bootstrap.md' ? { profile: 'full' } : {},
+        ),
       homeLink: homeLinkTarget === (safeRealTarget(runtime.pkgRoot) || normalizePath(runtime.pkgRoot)),
-      globalHomeLink: homeLinkTarget === (safeRealTarget(pluginRoot) || normalizePath(pluginRoot)),
+      globalHomeLink: homeLinkTarget === runtimeRoot,
       modelInstructionsFile: !!modelInstructionsLine,
       modelInstructionsPathMatch: !!modelInstructionsLine && normalizePath(modelInstructionsLine).includes(`"${CODEX_MANAGED_MODEL_INSTRUCTIONS_PATH}"`),
-      codexNotify: codexConfig.includes('codex-notify'),
-      notifyPathMatch: codexConfig.includes(CODEX_MANAGED_NOTIFY_VALUE),
-      codexHooksFeature: !/^\s*hooks\s*=\s*false\b/.test(hooksFeatureLine)
-        && !/^\s*codex_hooks\s*=\s*false\b/.test(legacyHooksFeatureLine),
+      codexNotify: notifyAnalysis.containsCodexNotify,
+      notifyPathMatch: notifyAnalysis.managed,
+      notifyShape: notifyAnalysis.shape,
+      codexHooksFeature: !/^\s*hooks\s*=\s*false\b/.test(hooksFeatureLine),
       codexGoalsFeature: /^\s*goals\s*=\s*true\b/.test(goalsFeatureLine),
-      legacyCodexHooksFeature: Boolean(legacyHooksFeatureLine),
       standaloneHooks: JSON.stringify(codexHooks.hooks || {}).includes('helloagents'),
       standaloneHooksMatch: managedHooksMatch(codexHooks.hooks || {}, expectedHooks),
+      managedHookTrust: expectedHookTrust.every((entry) => managedHookTrust.has(entry.key)),
+      managedHookTrustMatch: expectedHookTrust.every((entry) => managedHookTrust.get(entry.key) === entry.trustedHash),
       pluginRoot: existsSync(pluginRoot),
       pluginCache: existsSync(pluginCacheRoot),
-      pluginCarrierMatch: normalizeText(safeRead(join(pluginRoot, 'AGENTS.md')) || '') === readExpectedCarrierContent(runtime, 'bootstrap.md', settings),
-      pluginCacheCarrierMatch: normalizeText(safeRead(join(pluginCacheRoot, 'AGENTS.md')) || '') === readExpectedCarrierContent(runtime, 'bootstrap.md', settings),
+      pluginRootLink: pluginRootTarget === runtimeRoot,
+      pluginCacheLink: pluginCacheTarget === runtimeRoot,
+      pluginGenericHooks,
+      pluginCacheGenericHooks,
+      pluginCarrierMatch: normalizeText(safeRead(join(pluginRoot, 'AGENTS.md')) || '') === readExpectedCarrierContent(runtime, 'bootstrap.md', settings, { profile: 'full' }),
+      pluginCacheCarrierMatch: normalizeText(safeRead(join(pluginCacheRoot, 'AGENTS.md')) || '') === readExpectedCarrierContent(runtime, 'bootstrap.md', settings, { profile: 'full' }),
       marketplaceEntry: Array.isArray(marketplace.plugins) && marketplace.plugins.some((plugin) => plugin?.name === CODEX_PLUGIN_NAME),
       pluginEnabled: codexConfig.includes(CODEX_PLUGIN_CONFIG_HEADER) && codexConfig.includes('enabled = true'),
-      globalNotifyPathMatch: codexConfig.includes(CODEX_MANAGED_NOTIFY_VALUE),
+      globalNotifyPathMatch: notifyAnalysis.managed,
       pluginVersionMatch: false,
       pluginCacheVersionMatch: false,
     },
@@ -181,6 +351,7 @@ export function inspectCodexDoctor(runtime, settings) {
   const host = 'codex'
   const trackedMode = normalizeDoctorMode(runtime.getTrackedHostMode(settings, host))
   const detectedMode = normalizeDoctorMode(runtime.detectHostMode(host))
+  const nativeDoctor = inspectNativeCodexDoctor(runtime)
   const { checks, pluginVersion, cacheVersion } = buildCodexChecks(runtime, settings, trackedMode, detectedMode)
   checks.pluginVersionMatch = pluginVersion ? pluginVersion === runtime.pkgVersion : false
   checks.pluginCacheVersionMatch = cacheVersion ? cacheVersion === runtime.pkgVersion : false
@@ -201,8 +372,20 @@ export function inspectCodexDoctor(runtime, settings) {
   if (!checks.pluginVersionMatch && !pluginVersion && detectedMode === 'global') notes.push(runtime.msg('未读到 global 插件根目录版本信息', 'Global plugin root version was not readable'))
   if (!checks.pluginCacheVersionMatch && !cacheVersion && detectedMode === 'global') notes.push(runtime.msg('未读到 global 插件缓存版本信息', 'Global plugin cache version was not readable'))
   if (detectedMode !== 'none' && !checks.codexGoalsFeature) notes.push(runtime.msg('Codex /goal 未启用；如需长程执行，可运行 `helloagents codex goals enable`。', 'Codex /goal is not enabled; run `helloagents codex goals enable` if you need long-running goals.'))
-  if (detectedMode !== 'none' && checks.legacyCodexHooksFeature) notes.push(runtime.msg('检测到旧版 `codex_hooks`；HelloAGENTS 只兼容 Codex 最新版，建议移除旧 key。', 'Legacy `codex_hooks` was detected; HelloAGENTS targets latest Codex only, so remove the old key.'))
+  if (checks.notifyShape === 'chained') notes.push(runtime.msg('HelloAGENTS notify 当前通过 Codex Computer Use / wrapper 链式转发，仍视为有效。', 'HelloAGENTS notify is currently chained through Codex Computer Use / a wrapper and is still treated as valid.'))
+  if (!nativeDoctor.available) notes.push(runtime.msg('未检测到原生 `codex doctor`；当前仅检查 HelloAGENTS 受管覆盖层。', 'Native `codex doctor` was not available; only the HelloAGENTS managed overlay was checked.'))
 
   const status = summarizeDoctorStatus(issues, { trackedMode, detectedMode })
-  return { host, label: runtime.getHostLabel(host), trackedMode, detectedMode, status, checks, issues, notes, suggestedFix: suggestCodexDoctorFix(status, trackedMode) }
+  return {
+    host,
+    label: runtime.getHostLabel(host),
+    trackedMode,
+    detectedMode,
+    status,
+    checks,
+    nativeDoctor,
+    issues,
+    notes,
+    suggestedFix: suggestCodexDoctorFix(status, trackedMode),
+  }
 }

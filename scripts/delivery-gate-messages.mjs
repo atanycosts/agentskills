@@ -24,10 +24,8 @@ function issueHeading(issue) {
       return '任务缺少可交付元数据'
     case 'missing-contract':
       return '方案包缺少可信的结构化契约'
-    case 'missing-verify-evidence':
-      return '当前工作流缺少最新验证证据'
-    case 'missing-review-evidence':
-      return '当前工作流缺少最新审查证据'
+    case 'missing-qa-review-evidence':
+      return '当前工作流缺少最新 qa-review 证据'
     case 'missing-advisor-evidence':
       return '当前工作流缺少最新 advisor 证据'
     case 'missing-visual-evidence':
@@ -54,17 +52,20 @@ export function buildDeliveryBlockReason(issues, recommendation, gateHint) {
 
   lines.push('')
   if (recommendation?.nextPath) {
-    lines.push(`建议路径：${recommendation.nextPath}`)
+    lines.push(`处理路径：${recommendation.nextPath}`)
   }
   if (issues.some((issue) => issue.type === 'missing-closeout-evidence')) {
-    lines.push('下一步收尾：先写入当前会话 `artifacts/closeout.json`，记录 `requirementsCoverage` 和 `deliveryChecklist`，再报告完成。')
+    lines.push('收尾动作：先写入当前会话 `artifacts/closeout.json`，记录 `requirementsCoverage` 和 `deliveryChecklist`，再报告完成。')
   }
   if (issues.some((issue) => issue.type === 'missing-visual-evidence')) {
-    lines.push('下一步视觉验收：先写入当前会话 `artifacts/visual.json`，记录 `tooling`、`screensChecked`、`statesChecked`、`status` 和 `summary`，再报告完成。')
+    lines.push('视觉验收动作：先写入当前会话 `artifacts/visual.json`，记录 `tooling`、`screensChecked`、`statesChecked`、`status` 和 `summary`，再报告完成。')
+  }
+  if (issues.some((issue) => issue.type === 'missing-qa-review-evidence')) {
+    lines.push('质量闭环动作：先完成 `~qa` 或写入当前会话 `artifacts/qa-review.json`，记录结论、问题定位、验证命令与最新结果，再报告完成。')
   }
   if (gateHint) {
     lines.push(gateHint)
   }
-  lines.push('暂不要报告完成。先完成剩余任务、明确关闭任务，或修复方案包，使其成为可信的交付记录。')
+  lines.push('暂不要报告完成。先完成剩余任务、补齐收尾证据，或修复方案包，使其成为可信的交付记录。')
   return lines.join('\n')
 }

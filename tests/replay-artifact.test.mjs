@@ -27,7 +27,10 @@ test('replay artifact stays inactive until project activation and records event-
   const { root: pkgRoot } = createPackageFixture()
   const home = createHomeFixture()
   const project = createTempDir('helloagents-replay-')
-  const env = buildHomeEnv(home)
+  const env = {
+    ...buildHomeEnv(home),
+    HELLOAGENTS_TRACE_EVENTS: '1',
+  }
   const notifyScript = join(pkgRoot, 'scripts', 'notify.mjs')
   const closeoutScript = join(pkgRoot, 'scripts', 'closeout-state.mjs')
 
@@ -88,7 +91,7 @@ test('replay artifact stays inactive until project activation and records event-
     input: JSON.stringify({
       cwd: project,
       source: 'manual',
-      originCommand: 'verify',
+      originCommand: 'qa',
       requirementsCoverage: {
         status: 'PASS',
         summary: 'requirements covered',
@@ -101,7 +104,7 @@ test('replay artifact stays inactive until project activation and records event-
   })
   assert.equal(result.status, 0, result.stderr || result.stdout)
 
-  const sessionDir = join(project, '.helloagents', 'sessions', 'detached', 'default')
+  const sessionDir = join(project, '.helloagents', 'sessions', 'workspace', 'default')
   const eventPath = join(sessionDir, 'events.jsonl')
   assert.equal(existsSync(eventPath), true)
 

@@ -6,7 +6,7 @@
 #   HELLOAGENTS_TARGET=all|claude|gemini|codex
 #   HELLOAGENTS_MODE=standby|global
 #   HELLOAGENTS_BRANCH=main|beta|...
-#   HELLOAGENTS_PACKAGE=helloagents|github:owner/repo#ref|...
+#   HELLOAGENTS_PACKAGE=helloagents|https://github.com/owner/repo/archive/refs/heads/ref.tar.gz|...
 
 $ErrorActionPreference = "Stop"
 
@@ -15,6 +15,8 @@ $Target = if ($env:HELLOAGENTS_TARGET) { $env:HELLOAGENTS_TARGET } else { "" }
 $Mode = if ($env:HELLOAGENTS_MODE) { $env:HELLOAGENTS_MODE } else { "" }
 $Branch = if ($env:HELLOAGENTS_BRANCH) { $env:HELLOAGENTS_BRANCH } else { "" }
 $Package = if ($env:HELLOAGENTS_PACKAGE) { $env:HELLOAGENTS_PACKAGE } else { "" }
+$HasExplicitPackage = [bool]$Package
+$HasExplicitTarget = $false
 
 if ($env:HELLOAGENTS) {
     $Parts = $env:HELLOAGENTS.Split(":", 2)
@@ -25,48 +27,73 @@ if ($env:HELLOAGENTS) {
     if (-not $Mode -and $Parts.Count -gt 1) { $Mode = $Parts[1] }
 }
 
+$HasExplicitTarget = [bool]$Target
+
 if (-not $Target) { $Target = "all" }
-if (-not $Mode) { $Mode = "standby" }
 $Target = $Target.ToLowerInvariant()
-$Mode = $Mode.ToLowerInvariant()
+if ($Mode) { $Mode = $Mode.ToLowerInvariant() }
 
 if (@("all", "claude", "gemini", "codex") -notcontains $Target) {
     throw "Unsupported HELLOAGENTS target: $Target"
 }
 
-if (@("standby", "global") -notcontains $Mode) {
+if ($Mode -and @("standby", "global") -notcontains $Mode) {
     throw "Unsupported HELLOAGENTS mode: $Mode"
 }
 
 if (-not $Package) {
     if ($Branch) {
-        $Package = "github:hellowind777/helloagents#$Branch"
+        $Package = "https://github.com/hellowind777/helloagents/archive/refs/heads/$Branch.tar.gz"
     } else {
         $Package = "helloagents"
     }
 }
 
 function Invoke-Npm {
-    param([string[]]$Args)
-    & npm @Args
+    param([string[]]$NpmArgs)
+    & npm @NpmArgs
     if ($LASTEXITCODE -ne 0) {
-        throw "npm $($Args -join ' ') failed with exit code $LASTEXITCODE"
+        throw "npm $($NpmArgs -join ' ') failed with exit code $LASTEXITCODE"
     }
 }
+
+function Clear-HelloagentsEnv {
+    foreach ($name in @(
+        "HELLOAGENTS",
+        "HELLOAGENTS_ACTION",
+        "HELLOAGENTS_TARGET",
+        "HELLOAGENTS_HOST",
+        "HELLOAGENTS_MODE",
+        "HELLOAGENTS_BRANCH",
+        "HELLOAGENTS_PACKAGE",
+        "HELLOAGENTS_DEPLOY"
+    )) {
+        Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+    }
+}
+
+Clear-HelloagentsEnv
 
 function Enable-PostinstallDeploy {
     $env:HELLOAGENTS_DEPLOY = "1"
     $env:HELLOAGENTS_TARGET = $Target
-    $env:HELLOAGENTS_MODE = $Mode
+    if ($Mode) {
+        $env:HELLOAGENTS_MODE = $Mode
+    } else {
+        $env:HELLOAGENTS_MODE = "standby"
+    }
 }
 
 function Invoke-HostScript {
     param([string]$ScriptName)
+    $scriptArgs = @("explore", "-g", "helloagents", "--", "npm", "run", $ScriptName, "--")
     if ($Target -eq "all") {
-        Invoke-Npm @("explore", "-g", "helloagents", "--", "npm", "run", $ScriptName, "--", "--all", "--$Mode")
+        $scriptArgs += "--all"
     } else {
-        Invoke-Npm @("explore", "-g", "helloagents", "--", "npm", "run", $ScriptName, "--", $Target, "--$Mode")
+        $scriptArgs += $Target
     }
+    if ($Mode) { $scriptArgs += "--$Mode" }
+    Invoke-Npm -NpmArgs $scriptArgs
 }
 
 function Sync-Hosts {
@@ -83,35 +110,39 @@ function Uninstall-Hosts {
 
 switch ($Action) {
     "install" {
-        Enable-PostinstallDeploy
-        Invoke-Npm @("install", "-g", $Package)
+        if ($HasExplicitTarget) {
+            Enable-PostinstallDeploy
+        }
+        Invoke-Npm -NpmArgs @("install", "-g", $Package)
     }
     "update" {
-        if ($Branch -or $env:HELLOAGENTS_PACKAGE) {
-            Invoke-Npm @("install", "-g", $Package)
+        if ($Branch -or $HasExplicitPackage) {
+            Invoke-Npm -NpmArgs @("install", "-g", $Package)
         } else {
             & npm update -g helloagents
             if ($LASTEXITCODE -ne 0) {
-                Invoke-Npm @("install", "-g", "helloagents")
+                Invoke-Npm -NpmArgs @("install", "-g", "helloagents")
             }
         }
-        Sync-Hosts
+        if ($HasExplicitTarget) {
+            Sync-Hosts
+        }
     }
     "cleanup" {
         Cleanup-Hosts
     }
     "switch-branch" {
-        if (-not $Branch -and -not $env:HELLOAGENTS_PACKAGE) {
+        if (-not $Branch -and -not $HasExplicitPackage) {
             throw "HELLOAGENTS_BRANCH or HELLOAGENTS_PACKAGE is required for switch-branch"
         }
-        Invoke-Npm @("install", "-g", $Package)
+        Invoke-Npm -NpmArgs @("install", "-g", $Package)
         Sync-Hosts
     }
     "branch" {
-        if (-not $Branch -and -not $env:HELLOAGENTS_PACKAGE) {
+        if (-not $Branch -and -not $HasExplicitPackage) {
             throw "HELLOAGENTS_BRANCH or HELLOAGENTS_PACKAGE is required for branch"
         }
-        Invoke-Npm @("install", "-g", $Package)
+        Invoke-Npm -NpmArgs @("install", "-g", $Package)
         Sync-Hosts
     }
     "uninstall" {
@@ -120,7 +151,7 @@ switch ($Action) {
         } catch {
             Write-Warning "Failed to cleanup HelloAGENTS host integrations before uninstall: $_"
         }
-        Invoke-Npm @("uninstall", "-g", "helloagents")
+        Invoke-Npm -NpmArgs @("uninstall", "-g", "helloagents")
     }
     default {
         throw "Unsupported HELLOAGENTS_ACTION: $Action"

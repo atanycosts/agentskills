@@ -35,6 +35,7 @@ export function copyEntries(sourceRoot, targetRoot, entries) {
 export function createLink(target, linkPath) {
   removeLink(linkPath);
   try {
+    ensureDir(dirname(linkPath));
     symlinkSync(target, linkPath, IS_WIN ? 'junction' : 'dir');
     return true;
   } catch { return false; }
@@ -53,7 +54,16 @@ export function removeLink(p) {
 
 const MARKER = '<!-- HELLOAGENTS_START -->';
 const MARKER_END = '<!-- HELLOAGENTS_END -->';
+export const FULL_CARRIER_PROFILE_MARKER = '<!-- HELLOAGENTS_PROFILE: full -->';
 const MARKER_RE = new RegExp(`\\n*${MARKER}[\\s\\S]*?${MARKER_END}\\n*`, 'g');
+
+export function withCarrierProfile(content, profile = '') {
+  const normalized = String(content || '').trim();
+  if (!normalized) return '';
+  if (profile !== 'full') return `${normalized}\n`;
+  if (normalized.includes(FULL_CARRIER_PROFILE_MARKER)) return `${normalized}\n`;
+  return `${FULL_CARRIER_PROFILE_MARKER}\n${normalized}\n`;
+}
 
 /** Inject content wrapped in markers, preserving existing content outside markers. */
 export function injectMarkedContent(filePath, content) {
@@ -132,9 +142,9 @@ export function cleanSettingsHooks(settingsPath, cleanPermissions = false) {
 
 function rewriteHookCommandToCli(command = '', pathVar = '') {
   const replacements = new Map([
-    [`node "${pathVar}/scripts/notify.mjs"`, 'helloagents-js.cmd notify'],
-    [`node "${pathVar}/scripts/guard.mjs"`, 'helloagents-js.cmd guard'],
-    [`node "${pathVar}/scripts/ralph-loop.mjs"`, 'helloagents-js.cmd ralph-loop'],
+    [`node "${pathVar}/scripts/notify.mjs"`, 'helloagents-js notify'],
+    [`node "${pathVar}/scripts/guard.mjs"`, 'helloagents-js guard'],
+    [`node "${pathVar}/scripts/ralph-loop.mjs"`, 'helloagents-js ralph-loop'],
   ]);
 
   let next = command;

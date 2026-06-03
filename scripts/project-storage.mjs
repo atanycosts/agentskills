@@ -114,10 +114,10 @@ export function getProjectSessionStateScope(cwd, options = {}) {
   const scope = getProjectSessionScope(cwd, normalizeRuntimeOptions(options))
 
   return {
-    stateScope: 'session',
-    stateSessionToken: scope.session,
+    stateScope: 'workspace-session',
+    stateSessionToken: scope.session || '',
     stateSessionMode: scope.sessionMode,
-    stateBranch: scope.branch,
+    stateWorkspace: scope.workspace || scope.branch,
     sessionDir: scope.sessionDir,
     statePath: scope.statePath,
   }
@@ -168,7 +168,7 @@ export function getProjectStoreSummary(cwd, options = {}) {
     stateScope: stateScope.stateScope,
     stateSessionToken: stateScope.stateSessionToken,
     stateSessionMode: stateScope.stateSessionMode,
-    stateBranch: stateScope.stateBranch,
+    stateWorkspace: stateScope.stateWorkspace,
     sessionStateDir: stateScope.sessionDir,
     artifactsDir,
     usesSharedStore: projectStoreMode === 'repo-shared',
@@ -246,11 +246,8 @@ export function buildProjectStorageHint(cwd, options = {}) {
   const summary = getProjectStoreSummary(cwd, options)
   const hints = []
   hints.push(`当前状态文件写入 \`${summary.promptStatePath}\``)
-  if (summary.stateSessionMode === 'default') {
-    hints.push(`当前宿主未提供稳定会话标识，因此使用分支默认位置 \`${summary.stateSessionToken}\``)
-  }
   if (summary.usesSharedStore) {
-    hints.push(`项目存储：\`project_store_mode=repo-shared\`；本地激活/会话运行态目录仍是 \`${summary.promptActivationDir}\`，知识库/方案目录改为 \`${summary.promptStoreDir}\``)
+    hints.push(`项目存储：\`project_store_mode=repo-shared\`；项目本地存储/会话运行态目录仍是 \`${summary.promptActivationDir}\`，知识库/方案目录改为 \`${summary.promptStoreDir}\``)
   }
   return hints.join('。') + (hints.length > 0 ? '。' : '')
 }
@@ -263,10 +260,10 @@ export function buildProjectStorageBlock(cwd, options = {}) {
 
   const details = {
     project_store_mode: summary.projectStoreMode,
-    activation_dir: summary.promptActivationDir,
+    project_local_dir: summary.promptActivationDir,
     state_scope: summary.stateScope,
     state_path: summary.promptStatePath,
-    state_branch: summary.stateBranch,
+    state_workspace: summary.stateWorkspace,
     state_session_token: summary.stateSessionToken,
     state_session_mode: summary.stateSessionMode,
     session_state_dir: summary.promptSessionStateDir,
@@ -277,13 +274,10 @@ export function buildProjectStorageBlock(cwd, options = {}) {
 
   const explanations = []
   explanations.push('说明：状态文件只使用 `state_path`。')
-  if (summary.stateSessionMode === 'default') {
-    explanations.push('说明：当前宿主未提供稳定会话标识，因此使用分支默认位置。')
-  }
   if (summary.usesSharedStore) {
-    explanations.push('说明：状态文件与会话产物写本地激活目录；`context.md`、`guidelines.md`、`DESIGN.md`、`verify.yaml`、`modules/`、`plans/`、`archive/` 写知识库/方案目录。')
+    explanations.push('说明：状态文件与会话产物写项目本地存储目录；`context.md`、`guidelines.md`、`DESIGN.md`、`verify.yaml`、`modules/`、`plans/`、`archive/` 写知识库/方案目录。')
   } else {
-    explanations.push('说明：当前使用项目本地 `.helloagents/` 作为激活目录、知识库目录和方案目录。')
+    explanations.push('说明：当前使用项目本地 `.helloagents/` 作为知识、方案、状态和运行态目录。')
   }
 
   return [

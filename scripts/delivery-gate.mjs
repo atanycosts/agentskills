@@ -5,13 +5,13 @@
  * or when the plan artifacts are incomplete enough that delivery is not trustworthy.
  */
 import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { getAdvisorEvidenceStatus } from './advisor-state.mjs'
 import { getCloseoutEvidenceStatus } from './closeout-state.mjs'
 import { getAdvisorRequirement, getVisualValidationRequirement } from './plan-contract.mjs'
+import { getQaReviewEvidenceStatus } from './qa-review-state.mjs'
 import { getVisualEvidenceStatus } from './visual-state.mjs'
 import { buildDeliveryGateHint, getDeliveryAction, getWorkflowRecommendation, getWorkflowSnapshot } from './workflow-state.mjs'
-import { getReviewEvidenceStatus } from './review-state.mjs'
-import { getVerifyEvidenceStatus } from './verify-state.mjs'
 import { buildDeliveryBlockReason, buildUnderSpecifiedDetails } from './delivery-gate-messages.mjs'
 
 function selectGatePlans(snapshot) {
@@ -83,20 +83,12 @@ function collectPlanIssues(planEntries) {
   return issues
 }
 
-function collectEvidenceIssues(issues, verificationStatus, reviewStatus, advisorStatus, visualStatus, closeoutStatus) {
-  if (verificationStatus?.required && verificationStatus.status !== 'valid') {
+function collectEvidenceIssues(issues, qaStatus, advisorStatus, visualStatus, closeoutStatus) {
+  if (qaStatus?.required && qaStatus.status !== 'valid') {
     issues.push({
-      type: 'missing-verify-evidence',
+      type: 'missing-qa-review-evidence',
       planName: 'delivery',
-      details: verificationStatus.details,
-    })
-  }
-
-  if (reviewStatus?.required && reviewStatus.status !== 'valid') {
-    issues.push({
-      type: 'missing-review-evidence',
-      planName: 'delivery',
-      details: reviewStatus.details,
+      details: qaStatus.details,
     })
   }
   if (advisorStatus?.required && advisorStatus.status !== 'valid') {
@@ -123,31 +115,33 @@ function collectEvidenceIssues(issues, verificationStatus, reviewStatus, advisor
   }
 }
 
-function collectGateIssues(planEntries, verificationStatus, reviewStatus, advisorStatus, visualStatus, closeoutStatus) {
+function collectGateIssues(planEntries, qaStatus, advisorStatus, visualStatus, closeoutStatus) {
   const issues = collectPlanIssues(planEntries)
-  collectEvidenceIssues(issues, verificationStatus, reviewStatus, advisorStatus, visualStatus, closeoutStatus)
+  collectEvidenceIssues(issues, qaStatus, advisorStatus, visualStatus, closeoutStatus)
   return issues
 }
 
-function main() {
-  let data = {}
+function readStdinJson() {
   try {
-    data = JSON.parse(readFileSync(0, 'utf-8'))
-  } catch {}
+    return JSON.parse(readFileSync(0, 'utf-8'))
+  } catch {
+    return {}
+  }
+}
+
+export function evaluateDeliveryGate(data = {}) {
   const cwd = data.cwd || process.cwd()
   const workflowOptions = { payload: data }
   const snapshot = getWorkflowSnapshot(cwd, workflowOptions)
   const recommendation = getWorkflowRecommendation(cwd, workflowOptions)
-  const verificationStatus = getVerifyEvidenceStatus(cwd, workflowOptions)
   const deliveryAction = getDeliveryAction(cwd, workflowOptions)
   const gatePlans = selectGatePlans(snapshot)
-  const reviewStatus = getReviewEvidenceStatus(cwd, {
-    required: deliveryAction?.phase === 'verify' && deliveryAction?.mode === 'review-first',
+  const qaStatus = getQaReviewEvidenceStatus(cwd, {
+    required: deliveryAction?.phase === 'qa' || deliveryAction?.phase === 'consolidate',
     ...workflowOptions,
   })
   if (gatePlans.length === 0) {
-    process.stdout.write(JSON.stringify({ suppressOutput: true }))
-    return
+    return { suppressOutput: true }
   }
 
   const advisorRequirements = gatePlans.map((entry) => getAdvisorRequirement(entry.contract))
@@ -165,8 +159,7 @@ function main() {
   })
   const closeoutRequired = (
     gatePlans.every((entry) => entry.missingFiles.length === 0 && entry.templateIssues.length === 0 && entry.taskSummary.total > 0 && entry.taskSummary.open === 0 && entry.taskSummary.underSpecifiedCount === 0)
-    && (!verificationStatus.required || verificationStatus.status === 'valid')
-    && (!reviewStatus.required || reviewStatus.status === 'valid')
+    && (!qaStatus.required || qaStatus.status === 'valid')
     && (!advisorStatus.required || advisorStatus.status === 'valid')
     && (!visualStatus.required || visualStatus.status === 'valid')
   )
@@ -175,17 +168,22 @@ function main() {
     ...workflowOptions,
   })
 
-  const issues = collectGateIssues(gatePlans, verificationStatus, reviewStatus, advisorStatus, visualStatus, closeoutStatus)
+  const issues = collectGateIssues(gatePlans, qaStatus, advisorStatus, visualStatus, closeoutStatus)
   if (issues.length === 0) {
-    process.stdout.write(JSON.stringify({ suppressOutput: true }))
-    return
+    return { suppressOutput: true }
   }
 
-  process.stdout.write(JSON.stringify({
+  return {
     decision: 'block',
     reason: buildDeliveryBlockReason(issues, recommendation, buildDeliveryGateHint(cwd, workflowOptions)),
     suppressOutput: true,
-  }))
+  }
 }
 
-main()
+function main() {
+  process.stdout.write(JSON.stringify(evaluateDeliveryGate(readStdinJson())))
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  main()
+}

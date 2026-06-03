@@ -21,20 +21,22 @@ test('plugin manifests and host hook files match their target CLIs', () => {
   assert.equal(claudeMarketplace.name, 'helloagents');
   assert.doesNotMatch(claudeMarketplace.description, /Development/);
   assert.equal(claudeMarketplace.plugins[0].name, 'helloagents');
-  assert.deepEqual(claudeMarketplace.plugins[0].source, {
-    source: 'github',
-    repo: 'hellowind777/helloagents',
-  });
+  assert.equal(claudeMarketplace.plugins[0].source, './');
+  assert.equal(claudeMarketplace.plugins[0].skills, undefined);
+  assert.equal(claudeMarketplace.plugins[0].hooks, undefined);
+  assert.equal(claudeMarketplace.plugins[0].strict, undefined);
   assert.equal(claudeMarketplace.plugins[0].version, undefined);
 
   const codexPlugin = JSON.parse(read('.codex-plugin/plugin.json'));
   assert.equal(codexPlugin.skills, './skills');
   assert.equal(codexPlugin.hooks, undefined);
+  assert.equal(Array.isArray(codexPlugin.interface?.defaultPrompt), true);
+  assert.equal(codexPlugin.interface.defaultPrompt.length <= 3, true);
 
   const geminiExtension = JSON.parse(read('gemini-extension.json'));
   assert.equal(geminiExtension.contextFileName, 'bootstrap.md');
 
-  const geminiHooks = read('hooks/hooks.json');
+  const geminiHooks = read('hooks/hooks-gemini.json');
   assert.match(geminiHooks, /BeforeAgent/);
   assert.match(geminiHooks, /pre-write --gemini/);
   assert.match(geminiHooks, /write_file\|edit_file/);
@@ -48,6 +50,7 @@ test('plugin manifests and host hook files match their target CLIs', () => {
   assert.match(claudeHooks, /\$\{CLAUDE_PLUGIN_ROOT\}/);
   assert.match(claudeHooks, /--claude/);
   assert.doesNotMatch(claudeHooks, /BeforeAgent/);
+  assert.throws(() => read('hooks/hooks.json'));
 
   const codexHooks = read('hooks/hooks-codex.json');
   assert.match(codexHooks, /SessionStart/);
@@ -64,8 +67,8 @@ test('bootstrap path rules no longer depend on host-name placeholders or wrong c
     assert.doesNotMatch(content, /当前CLI名称/);
     assert.doesNotMatch(content, /本文件所在目录\/skills\/commands/);
     assert.doesNotMatch(content, /本文件所在目录\/skills\/\{技能名\}/);
-    assert.match(content, /## \.helloagents\/ 目录/);
-    assert.match(content, /## 项目上下文/);
+    assert.match(content, /### \.helloagents\/ 目录/);
+    assert.match(content, /## 项目存储与上下文/);
     assert.match(content, /路径定义：`\{HELLOAGENTS_READ_ROOT\}`/);
     assert.match(content, /不要读取项目路径|不要.*项目目录.*HelloAGENTS skills 路径/);
     assert.match(content, /同一路径的配置文件、模块、SKILL、模板只读一次/);

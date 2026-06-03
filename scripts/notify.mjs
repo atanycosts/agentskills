@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// notify.mjs — Unified notification & bootstrap injection for HelloAGENTS
+// notify.mjs — Unified notification and rule injection for HelloAGENTS
 // Zero external dependencies, ES module, cross-platform
 
 import { join, dirname } from 'node:path';
@@ -7,15 +7,20 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { playSound as _playSound, desktopNotify as _desktopNotify } from './notify-ui.mjs';
+import {
+  beginCodexCloseoutClaim,
+  finalizeCodexCloseoutClaim,
+  hasCodexQuickNotifyEvidence,
+  writeCodexQuickNotifyEvidence,
+} from './notify-closeout.mjs';
 import { resolveNotificationSource } from './notify-source.mjs';
 import { buildCompactionContext, buildInjectContext, buildRouteInstruction, buildSemanticRouteInstruction, resolveCanonicalCommandSkill } from './notify-context.mjs';
 import { resolveNotifyHost, shouldIgnoreCodexNotifyClient } from './notify-events.mjs';
-import { runGateScript } from './notify-gates.mjs';
 import { normalizeNotifyPayload } from './notify-payload.mjs';
+import { cleanupProjectSessions, PROJECT_SESSION_CLEANUP_COOLDOWN_MS } from './project-session-cleanup.mjs';
 import { handleRouteCommand, resolveBootstrapFile } from './notify-route.mjs';
 import { readSettings, readStdinJson, output, suppressedOutput, emptySuppress } from './notify-shared.mjs';
 import { clearRouteContext, getApplicableRouteContext, writeRouteContext } from './runtime-context.mjs';
-import { readRuntimeEvidence, writeRuntimeEvidence } from './runtime-artifacts.mjs';
 import { appendReplayEvent, startReplaySession } from './replay-state.mjs';
 import { clearTurnState, readTurnState } from './turn-state.mjs';
 import { getWorkflowRecommendation } from './workflow-state.mjs';
@@ -36,10 +41,16 @@ const EVENT_NAME = {
   UserPromptSubmit: IS_GEMINI ? 'BeforeAgent' : 'UserPromptSubmit',
   PreCompact: IS_GEMINI ? 'BeforeAgent' : 'PreCompact',
 };
-const RALPH_LOOP_ROUTE_COMMANDS = new Set(['verify', 'loop']);
-const CODEX_NATIVE_STOP_FILE = 'codex-native-stop.json';
+const RALPH_LOOP_ROUTE_COMMANDS = new Set(['qa', 'loop']);
+const CODEX_HOOKS_FILE = join(homedir(), '.codex', 'hooks.json');
+const GATE_MODULE_LOADERS = {
+  'turn-stop-gate': () => import('./turn-stop-gate.mjs'),
+  'delivery-gate': () => import('./delivery-gate.mjs'),
+  'ralph-loop': () => import('./ralph-loop.mjs'),
+};
+const gateEvaluatorCache = new Map();
 
-const playSound = (event) => _playSound(PKG_ROOT, event);
+const playSound = (event, options) => _playSound(PKG_ROOT, event, options);
 const desktopNotify = (event, extra) => _desktopNotify(PKG_ROOT, event, extra);
 
 function normalizeNotifyLevel(value) {
@@ -47,13 +58,13 @@ function normalizeNotifyLevel(value) {
   return [0, 1, 2, 3].includes(level) ? level : 0;
 }
 
-function notifyByLevel(event, extra, settings = getSettings()) {
+function notifyByLevel(event, extra, settings = getSettings(), options = {}) {
   const level = normalizeNotifyLevel(settings.notify_level ?? 0);
   if (level === 1) desktopNotify(event, extra);
-  if (level === 2) playSound(event);
+  if (level === 2) playSound(event, options);
   if (level === 3) {
     desktopNotify(event, extra);
-    playSound(event);
+    playSound(event, options);
   }
 }
 
@@ -77,6 +88,59 @@ function getSettings() {
   return readSettings(CONFIG_FILE);
 }
 
+function hasTruthyAgentFlag(value) {
+  if (typeof value === 'boolean') return value;
+  const normalized = String(value || '').trim().toLowerCase();
+  return ['1', 'true', 'yes', 'subagent'].includes(normalized);
+}
+
+function hasNonEmptyValue(value) {
+  return String(value || '').trim().length > 0;
+}
+
+function looksLikeCodexDelegatedTurn(payload = {}) {
+  if (!IS_CODEX || !payload || typeof payload !== 'object') return false;
+  const client = String(payload.client || '').trim();
+  const inputMessages = Array.isArray(payload.inputMessages) ? payload.inputMessages : [];
+  return !client && inputMessages.length > 1;
+}
+
+function isSubagentPayload(payload = {}) {
+  if (!payload || typeof payload !== 'object') return false;
+
+  if ([payload.isSubagent, payload.subagent].some(hasTruthyAgentFlag)) {
+    return true;
+  }
+
+  const roleLike = [
+    payload.role,
+    payload.agentRole,
+    payload.agent_role,
+    payload.agentKind,
+    payload.agent_kind,
+    payload.kind,
+  ]
+    .map((value) => String(value || '').trim().toLowerCase())
+    .filter(Boolean);
+
+  if (roleLike.some((value) => ['subagent', 'delegate', 'delegated', 'worker', 'explorer'].includes(value))) {
+    return true;
+  }
+
+  if ([
+    payload.parentAgentId,
+    payload.parent_agent_id,
+    payload.parentTurnId,
+    payload.parent_turn_id,
+    payload.delegatedByAgentId,
+    payload.delegated_by_agent_id,
+  ].some(hasNonEmptyValue)) {
+    return true;
+  }
+
+  return looksLikeCodexDelegatedTurn(payload);
+}
+
 function shouldRunRalphLoop(cwd, turnState, payload = {}) {
   if (!turnState || turnState.kind !== 'complete') return false;
   if (turnState.requiresDeliveryGate) return true;
@@ -84,48 +148,197 @@ function shouldRunRalphLoop(cwd, turnState, payload = {}) {
   return RALPH_LOOP_ROUTE_COMMANDS.has(routeContext?.skillName);
 }
 
-function runRalphLoop(payload, { turnState } = {}) {
+function buildGateErrorReason(source, detail = '') {
+  return [
+    `[HelloAGENTS Runtime] ${source} 执行失败，已暂停完成通知。`,
+    detail ? `原因：${detail}` : '',
+    '请修复脚本或重新运行验证后再报告完成。',
+  ].filter(Boolean).join('\n');
+}
+
+function emitInlineGateError(payload, source, detail = '') {
+  const reason = buildGateErrorReason(source, detail);
+  appendReplayEvent(payload.cwd || process.cwd(), {
+    host: HOST,
+    event: 'runtime_gate_error',
+    source,
+    reason,
+    payload,
+  });
+  output({
+    decision: 'block',
+    reason,
+    suppressOutput: true,
+  });
+  return true;
+}
+
+function stringifyStreamChunk(chunk, encoding) {
+  if (typeof chunk === 'string') return chunk;
+  if (chunk instanceof Uint8Array || Buffer.isBuffer(chunk)) {
+    return Buffer.from(chunk).toString(typeof encoding === 'string' ? encoding : 'utf-8');
+  }
+  return String(chunk ?? '');
+}
+
+async function importGateModule(source) {
+  const loader = GATE_MODULE_LOADERS[source];
+  if (!loader) {
+    throw new Error(`无法解析的 JSON：未知 gate 模块 ${source}。`);
+  }
+
+  const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  let capturedStdout = '';
+  let capturedStderr = '';
+
+  process.stdout.write = (chunk, encoding, callback) => {
+    capturedStdout += stringifyStreamChunk(chunk, encoding);
+    if (typeof encoding === 'function') encoding();
+    if (typeof callback === 'function') callback();
+    return true;
+  };
+  process.stderr.write = (chunk, encoding, callback) => {
+    capturedStderr += stringifyStreamChunk(chunk, encoding);
+    if (typeof encoding === 'function') encoding();
+    if (typeof callback === 'function') callback();
+    return true;
+  };
+
+  try {
+    const module = await loader();
+    if (capturedStdout.trim() || capturedStderr.trim()) {
+      throw new Error(`无法解析的 JSON：模块导入时输出了意外内容。${capturedStdout || capturedStderr}`);
+    }
+    return module;
+  } finally {
+    process.stdout.write = originalStdoutWrite;
+    process.stderr.write = originalStderrWrite;
+  }
+}
+
+async function loadGateEvaluator(source, exportName) {
+  let evaluatorPromise = gateEvaluatorCache.get(source);
+  if (!evaluatorPromise) {
+    evaluatorPromise = importGateModule(source).then((module) => {
+      const evaluate = module?.[exportName];
+      if (typeof evaluate !== 'function') {
+        throw new Error(`无法解析的 JSON：模块未导出 ${exportName}。`);
+      }
+      return evaluate;
+    });
+    gateEvaluatorCache.set(source, evaluatorPromise);
+  }
+
+  try {
+    return await evaluatorPromise;
+  } catch (error) {
+    gateEvaluatorCache.delete(source);
+    throw error;
+  }
+}
+
+async function runInlineGate({ payload, source, blockEvent, exportName, evaluateArgs }) {
+  let evaluate;
+  try {
+    evaluate = await loadGateEvaluator(source, exportName);
+  } catch (error) {
+    return emitInlineGateError(payload, source, error?.message || String(error));
+  }
+
+  let gateOutput;
+  try {
+    gateOutput = await evaluate(...evaluateArgs);
+  } catch (error) {
+    return emitInlineGateError(payload, source, error?.message || String(error));
+  }
+
+  if (!gateOutput || typeof gateOutput !== 'object' || Array.isArray(gateOutput)) {
+    return emitInlineGateError(payload, source, '无法解析的 JSON：gate 返回值不是对象。');
+  }
+
+  if (gateOutput?.decision === 'block') {
+    appendReplayEvent(payload.cwd || process.cwd(), {
+      host: HOST,
+      event: blockEvent,
+      source,
+      reason: gateOutput.reason || '',
+      payload,
+    });
+    output(gateOutput);
+    return true;
+  }
+
+  return false;
+}
+
+async function runRalphLoop(payload, { turnState } = {}) {
   const settings = getSettings();
   if (settings.ralph_loop_enabled === false) return false;
   const cwd = payload.cwd || process.cwd();
   if (!shouldRunRalphLoop(cwd, turnState, payload)) return false;
-  return runGateScript({
+  return await runInlineGate({
     payload,
-    host: HOST,
-    scriptPath: join(__dirname, 'ralph-loop.mjs'),
-    args: IS_GEMINI ? ['--gemini'] : HOST === 'codex' ? ['--codex'] : [],
     source: 'ralph-loop',
     blockEvent: 'verify_gate_blocked',
-    timeout: 120_000,
-    appendReplayEvent,
-    output,
+    exportName: 'evaluateRalphLoop',
+    evaluateArgs: [payload, {
+      isSubagent: isSubagentPayload(payload),
+      isGemini: IS_GEMINI,
+      hookEventName: HOST === 'codex' ? 'Stop' : (IS_GEMINI ? 'SessionEnd' : 'Stop'),
+    }],
   });
 }
 
-function runDeliveryGate(payload) {
-  return runGateScript({
+async function runCodexSubagentGate(payload) {
+  if (!IS_CODEX || !isSubagentPayload(payload)) return false;
+  return await runInlineGate({
     payload,
-    host: HOST,
-    scriptPath: join(__dirname, 'delivery-gate.mjs'),
+    source: 'ralph-loop',
+    blockEvent: 'verify_gate_blocked',
+    exportName: 'evaluateRalphLoop',
+    evaluateArgs: [payload, {
+      isSubagent: true,
+      isGemini: false,
+      hookEventName: 'Stop',
+    }],
+  });
+}
+
+async function runDeliveryGate(payload) {
+  return await runInlineGate({
+    payload,
     source: 'delivery-gate',
     blockEvent: 'delivery_gate_blocked',
-    timeout: 30_000,
-    appendReplayEvent,
-    output,
+    exportName: 'evaluateDeliveryGate',
+    evaluateArgs: [payload],
   });
 }
 
-function runTurnStopGate(payload) {
-  return runGateScript({
+async function runTurnStopGate(payload) {
+  return await runInlineGate({
     payload,
-    host: HOST,
-    scriptPath: join(__dirname, 'turn-stop-gate.mjs'),
     source: 'turn-stop-gate',
     blockEvent: 'turn_stop_blocked',
-    timeout: 30_000,
-    appendReplayEvent,
-    output,
+    exportName: 'evaluateTurnStopGate',
+    evaluateArgs: [payload],
   });
+}
+
+function hasManagedCodexStopHook() {
+  if (!IS_CODEX) return false;
+  try {
+    const hooksData = JSON.parse(readFileSync(CODEX_HOOKS_FILE, 'utf-8'));
+    const groups = Array.isArray(hooksData?.hooks?.Stop) ? hooksData.hooks.Stop : [];
+    return groups.some((group) => Array.isArray(group?.hooks) && group.hooks.some((handler) =>
+      handler?.type === 'command'
+      && typeof handler.command === 'string'
+      && handler.command.includes('helloagents-js')
+      && handler.command.includes('notify stop --codex'),
+    ));
+  } catch {
+    return false;
+  }
 }
 
 function attachTurnSession(payload = {}, cwd = payload.cwd || process.cwd()) {
@@ -136,28 +349,11 @@ function attachTurnSession(payload = {}, cwd = payload.cwd || process.cwd()) {
     allowPpidFallback: !isProjectRuntimeActive(cwd),
   });
   if (!sessionId || payload.sessionId) return payload;
+  const aliasSource = String(process.env.HELLOAGENTS_NOTIFY_SESSION_ID || process.env.WT_SESSION || process.env.TERM_SESSION_ID || process.env.WINDOWID || '').trim();
+  if (aliasSource) {
+    return { ...payload, sessionId, _helloagentsSessionAlias: aliasSource };
+  }
   return { ...payload, sessionId };
-}
-
-function getCodexTurnId(payload = {}) {
-  return String(payload.turnId || payload.turn_id || payload['turn-id'] || '').trim();
-}
-
-function markCodexNativeStopProcessed(cwd, payload = {}) {
-  if (!IS_CODEX) return;
-  const turnId = getCodexTurnId(payload);
-  if (!turnId) return;
-  writeRuntimeEvidence(cwd, CODEX_NATIVE_STOP_FILE, {
-    turnId,
-    updatedAt: new Date().toISOString(),
-  }, { payload });
-}
-
-function hasCodexNativeStopProcessed(cwd, payload = {}) {
-  const turnId = getCodexTurnId(payload);
-  if (!turnId) return false;
-  const evidence = readRuntimeEvidence(cwd, CODEX_NATIVE_STOP_FILE, { payload });
-  return evidence?.turnId === turnId;
 }
 
 function readMainTurnState(cwd, payload = {}) {
@@ -169,9 +365,48 @@ function consumeMainTurnState(cwd, turnState, payload = {}) {
   if (turnState?.role === 'main') clearTurnState(cwd, { payload });
 }
 
-function shouldProcessCloseout(turnState) {
+function shouldEmitManagedCodexCompleteNotify(cwd, turnState, payload = {}) {
   if (turnState) return turnState.kind === 'complete';
-  return false;
+  const routeContext = getApplicableRouteContext({ cwd, payload });
+  return routeContext?.skillName !== 'auto';
+}
+
+async function processTurnCloseout(payload, turnPayload, turnState, settings = getSettings(), options = {}) {
+  const cwd = turnPayload.cwd || process.cwd();
+  const skipCompleteNotify = options.skipCompleteNotify === true;
+
+  if (await runTurnStopGate(turnPayload)) {
+    if (turnState && turnState.kind !== 'complete') consumeMainTurnState(cwd, turnState, turnPayload);
+    return { blocked: true };
+  }
+
+  if (!turnState) {
+    if (!skipCompleteNotify) notifyByLevel('complete', buildNotifyExtra(turnPayload), settings);
+    clearRouteContext({ cwd, payload: turnPayload });
+    return { blocked: false };
+  }
+
+  if (turnState.kind !== 'complete') {
+    consumeMainTurnState(cwd, turnState, turnPayload);
+    clearRouteContext({ cwd, payload: turnPayload });
+    return { blocked: false };
+  }
+
+  if (await runRalphLoop(turnPayload, { turnState })) {
+    consumeMainTurnState(cwd, turnState, turnPayload);
+    notifyByLevel('warning', buildNotifyExtra(payload), settings);
+    return { blocked: true };
+  }
+  if (await runDeliveryGate(turnPayload)) {
+    consumeMainTurnState(cwd, turnState, turnPayload);
+    notifyByLevel('warning', buildNotifyExtra(payload), settings);
+    return { blocked: true };
+  }
+
+  if (!skipCompleteNotify) notifyByLevel('complete', buildNotifyExtra(payload), settings);
+  consumeMainTurnState(cwd, turnState, turnPayload);
+  clearRouteContext({ cwd, payload: turnPayload });
+  return { blocked: false };
 }
 
 function cmdPreCompact() {
@@ -214,6 +449,7 @@ function cmdRoute() {
     clearRouteContext,
     appendReplayEvent,
     getWorkflowRecommendation,
+    recordReplayEvents: !IS_SILENT,
     suppress: (context) => IS_SILENT
       ? emptySuppress()
       : suppressedOutput(EVENT_NAME.UserPromptSubmit, context),
@@ -227,6 +463,7 @@ function cmdInject() {
   const cwd = payload.cwd || process.cwd();
   const settings = getSettings();
   const bootstrapFile = resolveBootstrapFile(cwd, settings, HOST);
+  const shouldEnsureProjectLocal = isProjectRuntimeActive(cwd);
 
   startReplaySession(cwd, {
     host: HOST,
@@ -234,20 +471,29 @@ function cmdInject() {
     bootstrapFile,
     installMode: settings.install_mode || '',
     payload,
+    ensureProjectLocal: shouldEnsureProjectLocal,
   });
-  appendReplayEvent(cwd, {
-    host: HOST,
-    event: 'session_injected',
-    source,
-    payload,
-    details: {
-      bootstrapFile,
-      installMode: settings.install_mode || '',
-      activatedProject: isProjectRuntimeActive(cwd),
-    },
-  });
+  if (!IS_SILENT) {
+    appendReplayEvent(cwd, {
+      host: HOST,
+      event: 'session_injected',
+      source,
+      payload,
+      details: {
+        bootstrapFile,
+        installMode: settings.install_mode || '',
+        activatedProject: isProjectRuntimeActive(cwd),
+      },
+    });
+  }
   clearRouteContext({ cwd, payload });
-  clearTurnState(cwd, { payload });
+  clearTurnState(cwd, {
+    payload,
+    ensureProjectLocal: shouldEnsureProjectLocal,
+  });
+  cleanupProjectSessions(cwd, {
+    minIntervalMs: IS_SILENT ? PROJECT_SESSION_CLEANUP_COOLDOWN_MS : 0,
+  });
   if (IS_SILENT) {
     emptySuppress();
     return;
@@ -269,53 +515,57 @@ function cmdInject() {
   suppressedOutput(EVENT_NAME.SessionStart, context || undefined);
 }
 
-function cmdStop() {
+async function cmdStop() {
   const payload = readPayloadFromStdin();
   const cwd = payload.cwd || process.cwd();
   const turnPayload = attachTurnSession(payload, cwd);
-  if (IS_CODEX && hasCodexNativeStopProcessed(cwd, turnPayload)) {
+  if (await runCodexSubagentGate(turnPayload)) return;
+  if (IS_CODEX && isSubagentPayload(turnPayload)) {
     emptySuppress();
     return;
   }
   const turnState = readMainTurnState(cwd, turnPayload);
-  if (runTurnStopGate(turnPayload)) {
-    if (turnState && turnState.kind !== 'complete') consumeMainTurnState(cwd, turnState, turnPayload);
-    markCodexNativeStopProcessed(cwd, turnPayload);
-    return;
-  }
-  const shouldProcess = shouldProcessCloseout(turnState);
-  if (shouldProcess && runRalphLoop(turnPayload, { turnState })) {
-    consumeMainTurnState(cwd, turnState, turnPayload);
-    notifyByLevel('warning', buildNotifyExtra(payload));
-    markCodexNativeStopProcessed(cwd, turnPayload);
-    return;
-  }
-  if (shouldProcess && runDeliveryGate(turnPayload)) {
-    consumeMainTurnState(cwd, turnState, turnPayload);
-    notifyByLevel('warning', buildNotifyExtra(payload));
-    markCodexNativeStopProcessed(cwd, turnPayload);
+  const managedCodexStopHook = IS_CODEX && hasManagedCodexStopHook();
+  const skipCompleteNotify = managedCodexStopHook && hasCodexQuickNotifyEvidence(cwd, {
+    payload: turnPayload,
+    turnState,
+  });
+  const closeoutClaim = IS_CODEX
+    ? beginCodexCloseoutClaim(cwd, { payload: turnPayload, turnState, source: 'stop' })
+    : null;
+  if (IS_CODEX && !closeoutClaim?.claimed) {
+    emptySuppress();
     return;
   }
 
-  const settings = getSettings();
-  if (shouldProcess || !turnState) {
-    notifyByLevel('complete', buildNotifyExtra(payload), settings);
+  let handled = false;
+  let result = { blocked: false };
+  try {
+    result = await processTurnCloseout(payload, turnPayload, turnState, getSettings(), {
+      skipCompleteNotify,
+    });
+    handled = true;
+  } finally {
+    finalizeCodexCloseoutClaim(closeoutClaim, {
+      handled,
+      source: 'stop',
+      event: 'stop',
+      turnKind: turnState?.kind || '',
+    });
   }
-  consumeMainTurnState(cwd, turnState, turnPayload);
-  clearRouteContext({ cwd, payload: turnPayload });
-  markCodexNativeStopProcessed(cwd, turnPayload);
+  if (result.blocked) return;
   emptySuppress();
 }
 
 function cmdSound() {
-  playSound(process.argv[3] || 'complete');
+  playSound(process.argv[3] || 'complete', { mode: 'blocking' });
 }
 
 function cmdDesktop() {
   desktopNotify(process.argv[3] || 'complete', buildNotifyExtra({ cwd: process.cwd() }));
 }
 
-function cmdCodexNotify() {
+async function cmdCodexNotify() {
   let data = {};
   try { data = JSON.parse(process.argv[3] || '{}'); } catch {}
   data = normalizeNotifyPayload(data);
@@ -327,54 +577,61 @@ function cmdCodexNotify() {
   if (shouldIgnoreCodexNotifyClient(client)) return;
 
   if (type === 'approval-requested') {
-    notifyByLevel('confirm', buildNotifyExtra(data));
+    notifyByLevel('confirm', buildNotifyExtra(data), getSettings(), { mode: 'blocking' });
     return;
   }
   if (type !== 'agent-turn-complete') return;
-  if (hasCodexNativeStopProcessed(cwd, turnPayload)) return;
+  const managedCodexStopHook = hasManagedCodexStopHook();
+  if (managedCodexStopHook && !String(turnPayload.client || '').trim()) return;
+  if (isSubagentPayload(turnPayload)) return;
+  if (managedCodexStopHook) {
+    const turnState = readMainTurnState(cwd, turnPayload);
+    if (shouldEmitManagedCodexCompleteNotify(cwd, turnState, turnPayload)) {
+      notifyByLevel('complete', buildNotifyExtra(data), getSettings(), { mode: 'blocking' });
+      writeCodexQuickNotifyEvidence(cwd, {
+        payload: turnPayload,
+        turnState,
+        event: type,
+      });
+    }
+    return;
+  }
 
   const turnState = readMainTurnState(cwd, turnPayload);
-  if (runTurnStopGate(turnPayload)) {
-    if (turnState && turnState.kind !== 'complete') consumeMainTurnState(cwd, turnState, turnPayload);
-    return;
-  }
-  if (!turnState) {
-    notifyByLevel('complete', buildNotifyExtra(data), getSettings());
-    clearRouteContext({ cwd, payload: turnPayload });
-    return;
-  }
-  if (turnState.kind !== 'complete') {
-    consumeMainTurnState(cwd, turnState, turnPayload);
-    clearRouteContext({ cwd, payload: turnPayload });
-    return;
-  }
+  const closeoutClaim = beginCodexCloseoutClaim(cwd, {
+    payload: turnPayload,
+    turnState,
+    source: 'codex-notify',
+  });
+  if (!closeoutClaim.claimed) return;
 
-  const settings = getSettings();
-  if (runRalphLoop(turnPayload, { turnState })) {
-    consumeMainTurnState(cwd, turnState, turnPayload);
-    notifyByLevel('warning', buildNotifyExtra(data), settings);
-    return;
+  let handled = false;
+  try {
+    await processTurnCloseout(data, turnPayload, turnState, getSettings());
+    handled = true;
+  } finally {
+    finalizeCodexCloseoutClaim(closeoutClaim, {
+      handled,
+      source: 'codex-notify',
+      event: type,
+      turnKind: turnState?.kind || '',
+    });
   }
-  if (runDeliveryGate(turnPayload)) {
-    consumeMainTurnState(cwd, turnState, turnPayload);
-    notifyByLevel('warning', buildNotifyExtra(data), settings);
-    return;
-  }
-
-  notifyByLevel('complete', buildNotifyExtra(data), settings);
-  consumeMainTurnState(cwd, turnState, turnPayload);
-  clearRouteContext({ cwd, payload: turnPayload });
 }
 
-switch (cmd) {
-  case 'inject':        cmdInject(); break;
-  case 'stop':          cmdStop(); break;
-  case 'pre-compact':   cmdPreCompact(); break;
-  case 'route':         cmdRoute(); break;
-  case 'sound':         cmdSound(); break;
-  case 'desktop':       cmdDesktop(); break;
-  case 'codex-notify':  cmdCodexNotify(); break;
-  default:
-    process.stderr.write(`notify.mjs: unknown command "${cmd}"\n`);
-    process.exit(1);
+async function main() {
+  switch (cmd) {
+    case 'inject':        cmdInject(); break;
+    case 'stop':          await cmdStop(); break;
+    case 'pre-compact':   cmdPreCompact(); break;
+    case 'route':         cmdRoute(); break;
+    case 'sound':         cmdSound(); break;
+    case 'desktop':       cmdDesktop(); break;
+    case 'codex-notify':  await cmdCodexNotify(); break;
+    default:
+      process.stderr.write(`notify.mjs: unknown command "${cmd}"\n`);
+      process.exit(1);
+  }
 }
+
+await main();

@@ -1,34 +1,40 @@
 import { join, dirname } from 'node:path';
 import { existsSync } from 'node:fs';
 import {
-  ensureDir, safeRead, safeWrite, removeIfExists,
-  readJsonOrThrow, copyEntries,
+  ensureDir, safeJson, safeRead, safeWrite, removeIfExists,
+  readJsonOrThrow,
   createLink, removeLink, injectMarkedContent, removeMarkedContent,
   cleanSettingsHooks, loadHooksWithCliEntry, mergeSettingsHooks,
 } from './cli-utils.mjs';
 import { ensureTimestampedBackup, readCodexBackup, removeCodexBackup } from './cli-codex-backup.mjs';
 import {
+  analyzeCodexNotifyBlock,
   CODEX_MANAGED_TOML_COMMENT,
   CODEX_MANAGED_MODEL_INSTRUCTIONS_PATH,
   CODEX_PLUGIN_CONFIG_HEADER,
   installCodexManagedTopLevelConfig,
+  installCodexManagedTuiConfig,
   isManagedCodexBackupInstruction,
   isManagedCodexGoalsFeature,
   isManagedCodexModelInstruction,
   isManagedCodexNotify,
-  isManagedLegacyCodexHooksFeature,
   readCodexGoalsFeatureLine,
-  readLegacyCodexHooksFeatureLine,
   removeCodexGoalsFeatureConfig,
-  removeLegacyManagedCodexHooksFeatureConfig,
+  removeCodexManagedTuiConfig,
   removeCodexPluginConfig,
   restoreCodexGoalsFeatureConfig,
   restoreCodexTopLevelConfig,
   upsertCodexPluginConfig,
 } from './cli-codex-config.mjs';
 import {
+  cleanupManagedCodexHookTrust,
+  syncManagedCodexHookTrust,
+} from './cli-codex-hooks-state.mjs';
+import {
+  hasTopLevelTomlBlock,
   readTopLevelTomlLine,
   readTopLevelTomlBlock,
+  removeTopLevelTomlBlock,
   removeTopLevelTomlLines,
 } from './cli-toml.mjs';
 import { buildRuntimeCarrier, readCarrierSettings } from './cli-runtime-carrier.mjs';
@@ -115,28 +121,31 @@ function removeCodexMarketplaceEntry(marketplaceFile) {
   return true;
 }
 
-function injectCodexRuntimeCarrier(filePath, bootstrapPath, settings) {
+function injectCodexRuntimeCarrier(filePath, bootstrapPath, settings, options = {}) {
   const bootstrapContent = safeRead(bootstrapPath);
   if (!bootstrapContent) return false;
-  injectMarkedContent(filePath, buildRuntimeCarrier(bootstrapContent, settings).trimEnd());
+  injectMarkedContent(filePath, buildRuntimeCarrier(bootstrapContent, settings, options).trimEnd());
   return true;
 }
 
-function writeCodexRuntimeCarrier(filePath, bootstrapPath, settings) {
+function writeCodexRuntimeCarrier(filePath, bootstrapPath, settings, options = {}) {
   const bootstrapContent = safeRead(bootstrapPath);
   if (!bootstrapContent) return false;
-  safeWrite(filePath, buildRuntimeCarrier(bootstrapContent, settings));
+  safeWrite(filePath, buildRuntimeCarrier(bootstrapContent, settings, options));
   return true;
 }
 
 function installCodexStandaloneHooks(home, pkgRoot) {
   const hooksData = loadHooksWithCliEntry(pkgRoot, 'hooks-codex.json', '${PLUGIN_ROOT}');
   if (!hooksData) return false;
-  mergeSettingsHooks(join(home, '.codex', CODEX_HOOKS_BASENAME), hooksData);
+  const hooksPath = join(home, '.codex', CODEX_HOOKS_BASENAME);
+  mergeSettingsHooks(hooksPath, hooksData);
+  syncManagedCodexHookTrust(join(home, '.codex', CODEX_CONFIG_BASENAME), hooksPath, safeJson(hooksPath));
   return true;
 }
 
 function cleanupCodexStandaloneHooks(home) {
+  cleanupManagedCodexHookTrust(join(home, '.codex', CODEX_CONFIG_BASENAME));
   cleanSettingsHooks(join(home, '.codex', CODEX_HOOKS_BASENAME));
 }
 
@@ -147,12 +156,11 @@ function cleanupCodexManagedConfig(configPath, { removePluginConfig = false } = 
   const currentModelInstructions = readTopLevelTomlLine(toml, 'model_instructions_file');
   const currentNotify = readTopLevelTomlBlock(toml, 'notify');
   const currentCodexGoalsFeature = readCodexGoalsFeatureLine(toml);
-  const currentLegacyCodexHooksFeature = readLegacyCodexHooksFeatureLine(toml);
+  const currentNotifyAnalysis = analyzeCodexNotifyBlock(currentNotify);
 
   const shouldRestoreModelInstructions = isManagedCodexModelInstruction(currentModelInstructions);
-  const shouldRestoreNotify = isManagedCodexNotify(currentNotify);
+  const shouldRestoreNotify = currentNotifyAnalysis.managed || isManagedCodexNotify(currentNotify);
   const shouldRestoreCodexGoalsFeature = isManagedCodexGoalsFeature(currentCodexGoalsFeature);
-  const shouldRemoveLegacyCodexHooksFeature = isManagedLegacyCodexHooksFeature(currentLegacyCodexHooksFeature);
 
   if (removePluginConfig) {
     toml = removeCodexPluginConfig(toml);
@@ -160,16 +168,16 @@ function cleanupCodexManagedConfig(configPath, { removePluginConfig = false } = 
   if (shouldRestoreCodexGoalsFeature) {
     toml = removeCodexGoalsFeatureConfig(toml);
   }
-  if (shouldRemoveLegacyCodexHooksFeature) {
-    toml = removeLegacyManagedCodexHooksFeatureConfig(toml);
-  }
+  toml = removeCodexManagedTuiConfig(toml);
   if (shouldRestoreModelInstructions) {
     toml = removeTopLevelTomlLines(toml, (line) =>
       line.startsWith('model_instructions_file =') && isManagedCodexModelInstruction(line)).text;
   }
   if (shouldRestoreNotify) {
-    toml = removeTopLevelTomlLines(toml, (line) =>
-      line.startsWith('notify =') && isManagedCodexNotify(line)).text;
+    toml = hasTopLevelTomlBlock(toml, 'notify')
+      ? removeTopLevelTomlBlock(toml, 'notify')
+      : removeTopLevelTomlLines(toml, (line) =>
+        line.startsWith('notify =')).text;
   }
 
   const backupModelInstructions = readTopLevelTomlLine(backupToml, 'model_instructions_file');
@@ -180,7 +188,7 @@ function cleanupCodexManagedConfig(configPath, { removePluginConfig = false } = 
     modelInstructionsLine: shouldRestoreModelInstructions && !isManagedCodexBackupInstruction(backupModelInstructions)
       ? backupModelInstructions
       : '',
-    notifyLine: shouldRestoreNotify && !isManagedCodexNotify(backupNotify)
+    notifyLine: shouldRestoreNotify && !analyzeCodexNotifyBlock(backupNotify).managed
       ? backupNotify
       : '',
   });
@@ -209,7 +217,7 @@ export function installCodexStandby(home, pkgRoot) {
   toml = installCodexManagedTopLevelConfig(toml, {
     modelInstructionsPath: CODEX_MANAGED_MODEL_INSTRUCTIONS_PATH,
   });
-  toml = removeLegacyManagedCodexHooksFeatureConfig(toml);
+  toml = installCodexManagedTuiConfig(toml);
   safeWrite(configPath, toml);
   installCodexStandaloneHooks(home, pkgRoot);
 
@@ -277,24 +285,20 @@ export function installCodexGlobal(home, pkgRoot) {
   removeIfExists(join(codexDir, 'plugins', 'cache', CODEX_MARKETPLACE_NAME, CODEX_PLUGIN_NAME));
 
   ensureDir(join(home, 'plugins'));
-  ensureDir(installedPluginRoot);
+  ensureDir(dirname(installedPluginRoot));
 
   const settings = readCarrierSettings(home);
-  copyEntries(pkgRoot, pluginRoot, CODEX_RUNTIME_ENTRIES);
-  copyEntries(pkgRoot, installedPluginRoot, CODEX_RUNTIME_ENTRIES);
-  createLink(pluginRoot, join(codexDir, 'helloagents'));
+  createLink(pkgRoot, pluginRoot);
+  createLink(pkgRoot, installedPluginRoot);
+  createLink(pkgRoot, join(codexDir, 'helloagents'));
   writeCodexRuntimeCarrier(
-    join(pluginRoot, CODEX_RUNTIME_CARRIER),
-    join(pluginRoot, 'bootstrap.md'),
+    join(pkgRoot, CODEX_RUNTIME_CARRIER),
+    join(pkgRoot, 'bootstrap.md'),
     settings,
-  );
-  writeCodexRuntimeCarrier(
-    join(installedPluginRoot, CODEX_RUNTIME_CARRIER),
-    join(installedPluginRoot, 'bootstrap.md'),
-    settings,
+    { profile: 'full' },
   );
   const homeCarrierPath = join(codexDir, CODEX_RUNTIME_CARRIER);
-  injectCodexRuntimeCarrier(homeCarrierPath, join(pkgRoot, 'bootstrap.md'), settings);
+  injectCodexRuntimeCarrier(homeCarrierPath, join(pkgRoot, 'bootstrap.md'), settings, { profile: 'full' });
 
   ensureDir(join(home, '.agents', 'plugins'));
   updateCodexMarketplace(marketplaceFile);
@@ -304,7 +308,7 @@ export function installCodexGlobal(home, pkgRoot) {
   toml = installCodexManagedTopLevelConfig(toml, {
     modelInstructionsPath: CODEX_MANAGED_MODEL_INSTRUCTIONS_PATH,
   });
-  toml = removeLegacyManagedCodexHooksFeatureConfig(toml);
+  toml = installCodexManagedTuiConfig(toml);
   toml = upsertCodexPluginConfig(toml);
   safeWrite(configPath, toml);
   installCodexStandaloneHooks(home, pkgRoot);

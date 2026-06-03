@@ -1,13 +1,26 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { chmodSync, existsSync } from 'node:fs'
+import { delimiter, join } from 'node:path'
 
 import { CODEX_MANAGED_NOTIFY_VALUE } from '../scripts/cli-codex-config.mjs'
-import { createHomeFixture, createPackageFixture, readJson, readText, realTarget, writeJson, writeText } from './helpers/test-env.mjs'
+import { getClaudeMarketplaceRoot, getGeminiExtensionRoot } from '../scripts/cli-runtime-root.mjs'
+import { createHomeFixture, createPackageFixture, createTempDir, readJson, readText, realTarget, writeJson, writeText } from './helpers/test-env.mjs'
 import { hasTimestampedBackup, runCli, seedHostConfigs } from './helpers/cli-test-helpers.mjs'
 
 const MANAGED_NOTIFY_LINE = `notify = ${CODEX_MANAGED_NOTIFY_VALUE} # helloagents-managed`
+
+function writeFakeCommand(binDir, name, logPath) {
+  if (process.platform === 'win32') {
+    const commandPath = join(binDir, `${name}.cmd`)
+    writeText(commandPath, `@echo off\r\necho %*>>"${logPath}"\r\nexit /b 0\r\n`)
+    return commandPath
+  }
+  const commandPath = join(binDir, name)
+  writeText(commandPath, `#!/bin/sh\necho "$@" >> "${logPath}"\nexit 0\n`)
+  chmodSync(commandPath, 0o755)
+  return commandPath
+}
 
 test('CLI lifecycle covers standby, global, update, cleanup, and config preservation', () => {
   const { root: pkgRoot } = createPackageFixture()
@@ -19,6 +32,7 @@ test('CLI lifecycle covers standby, global, update, cleanup, and config preserva
 
   const configFile = join(home, '.helloagents', 'helloagents.json')
   assert.equal(readJson(configFile).install_mode, 'standby')
+  assert.equal(readJson(configFile).auto_commit_enabled, true)
   assert.ok(!existsSync(join(home, '.claude', 'helloagents')))
   assert.ok(!existsSync(join(home, '.gemini', 'helloagents')))
   assert.ok(!existsSync(join(home, '.codex', 'helloagents')))
@@ -39,11 +53,11 @@ test('CLI lifecycle covers standby, global, update, cleanup, and config preserva
 
   const claudeSettingsText = JSON.stringify(readJson(join(home, '.claude', 'settings.json')))
   const geminiSettingsText = JSON.stringify(readJson(join(home, '.gemini', 'settings.json')))
-  assert.match(claudeSettingsText, /helloagents-js\.cmd notify/)
-  assert.match(claudeSettingsText, /helloagents-js\.cmd guard/)
+  assert.match(claudeSettingsText, /helloagents-js notify/)
+  assert.match(claudeSettingsText, /helloagents-js guard/)
   assert.doesNotMatch(claudeSettingsText, /scripts\/notify\.mjs/)
-  assert.match(geminiSettingsText, /helloagents-js\.cmd notify/)
-  assert.match(geminiSettingsText, /helloagents-js\.cmd guard/)
+  assert.match(geminiSettingsText, /helloagents-js notify/)
+  assert.match(geminiSettingsText, /helloagents-js guard/)
   assert.doesNotMatch(geminiSettingsText, /scripts\/notify\.mjs/)
 
   const codexConfigPath = join(home, '.codex', 'config.toml')
@@ -53,6 +67,7 @@ test('CLI lifecycle covers standby, global, update, cleanup, and config preserva
   assert.match(codexConfig, /model_instructions_file = "~\/\.codex\/AGENTS\.md" # helloagents-managed/)
   assert.doesNotMatch(codexConfig, /developer_instructions\s*=/)
   assert.match(codexConfig, /codex-notify/)
+  assert.match(codexConfig, /\[tui\]\nnotifications = \["plan-mode-prompt"\] # helloagents-managed/)
   assert.ok(codexConfig.startsWith([
     'model_instructions_file = "~/.codex/AGENTS.md" # helloagents-managed',
     MANAGED_NOTIFY_LINE,
@@ -77,16 +92,25 @@ test('CLI lifecycle covers standby, global, update, cleanup, and config preserva
 
   const pluginRoot = join(home, 'plugins', 'helloagents')
   const pluginCacheRoot = join(home, '.codex', 'plugins', 'cache', 'local-plugins', 'helloagents', 'local')
+  const geminiExtensionRoot = getGeminiExtensionRoot(home)
   assert.ok(existsSync(pluginRoot))
   assert.ok(existsSync(pluginCacheRoot))
-  assert.equal(realTarget(join(home, '.codex', 'helloagents')), pluginRoot)
+  assert.equal(realTarget(join(home, '.codex', 'helloagents')), runtimeRoot)
+  assert.equal(realTarget(pluginRoot), runtimeRoot)
+  assert.equal(realTarget(pluginCacheRoot), runtimeRoot)
+  assert.ok(!existsSync(join(runtimeRoot, 'hooks', 'hooks.json')))
+  assert.ok(existsSync(join(geminiExtensionRoot, 'hooks', 'hooks.json')))
   assert.ok(existsSync(join(pluginRoot, 'AGENTS.md')))
   assert.ok(existsSync(join(pluginCacheRoot, 'AGENTS.md')))
+  assert.match(readText(join(pluginRoot, 'AGENTS.md')), /HELLOAGENTS_PROFILE: full/)
+  assert.match(readText(join(pluginCacheRoot, 'AGENTS.md')), /HELLOAGENTS_PROFILE: full/)
+  assert.match(readText(join(home, '.codex', 'AGENTS.md')), /HELLOAGENTS_PROFILE: full/)
   assert.doesNotMatch(readText(join(pluginRoot, 'AGENTS.md')), /## 当前用户设置/)
   assert.doesNotMatch(readText(join(pluginCacheRoot, 'AGENTS.md')), /## 当前用户设置/)
 
   const globalCodexConfig = readText(codexConfigPath)
   assert.match(globalCodexConfig, /model_instructions_file = "~\/\.codex\/AGENTS\.md" # helloagents-managed/)
+  assert.match(globalCodexConfig, /\[tui\]\nnotifications = \["plan-mode-prompt"\] # helloagents-managed/)
   assert.ok(globalCodexConfig.startsWith([
     'model_instructions_file = "~/.codex/AGENTS.md" # helloagents-managed',
     MANAGED_NOTIFY_LINE,
@@ -118,6 +142,7 @@ test('CLI lifecycle covers standby, global, update, cleanup, and config preserva
   const finalCodexConfig = readText(codexConfigPath)
   assert.match(finalCodexConfig, /C:\/original\/bootstrap\.md/)
   assert.match(finalCodexConfig, /notify = \["node", "C:\/original\/notify\.mjs", "codex-notify"\]/)
+  assert.doesNotMatch(finalCodexConfig, /plan-mode-prompt/)
   assert.doesNotMatch(finalCodexConfig, /developer_instructions\s*=/)
 })
 
@@ -153,8 +178,39 @@ test('postinstall can deploy from compact HELLOAGENTS spec', () => {
   assert.ok(!existsSync(join(home, '.claude', 'helloagents')))
   assert.ok(!existsSync(join(home, '.gemini', 'helloagents')))
   assert.ok(existsSync(pluginRoot))
-  assert.equal(realTarget(join(home, '.codex', 'helloagents')), pluginRoot)
+  assert.equal(realTarget(join(home, '.codex', 'helloagents')), join(home, '.helloagents', 'helloagents'))
+  assert.equal(realTarget(pluginRoot), join(home, '.helloagents', 'helloagents'))
   assert.equal(readJson(join(home, '.helloagents', 'helloagents.json')).host_install_modes.codex, 'global')
+})
+
+test('postinstall and later lifecycle commands preserve existing auto_commit_enabled', () => {
+  const { root: pkgRoot } = createPackageFixture()
+  const home = createHomeFixture()
+  const configFile = join(home, '.helloagents', 'helloagents.json')
+  seedHostConfigs(home)
+
+  writeJson(configFile, {
+    output_language: '',
+    output_format: true,
+    notify_level: 0,
+    ralph_loop_enabled: true,
+    guard_enabled: true,
+    kb_create_mode: 1,
+    project_store_mode: 'local',
+    auto_commit_enabled: false,
+    commit_attribution: '',
+    install_mode: 'standby',
+    host_install_modes: {},
+  })
+
+  runCli(pkgRoot, home, ['postinstall'])
+  assert.equal(readJson(configFile).auto_commit_enabled, false)
+
+  runCli(pkgRoot, home, ['install', 'codex', '--standby'])
+  assert.equal(readJson(configFile).auto_commit_enabled, false)
+
+  runCli(pkgRoot, home, ['update', 'codex'])
+  assert.equal(readJson(configFile).auto_commit_enabled, false)
 })
 
 test('runtime carrier does not snapshot helloagents config into persistent rules files', () => {
@@ -174,4 +230,68 @@ test('runtime carrier does not snapshot helloagents config into persistent rules
   assert.doesNotMatch(codexAgents, /## 当前用户设置/)
   assert.doesNotMatch(codexAgents, /"output_format": false/)
   assert.match(codexAgents, /输出格式只在缺少 `output_format` 已知值时触发读取/)
+})
+
+test('global mode switch records only successful host setup', () => {
+  const { root: pkgRoot } = createPackageFixture()
+  const home = createHomeFixture()
+  const configFile = join(home, '.helloagents', 'helloagents.json')
+  seedHostConfigs(home)
+
+  runCli(pkgRoot, home, ['postinstall'])
+  runCli(pkgRoot, home, ['--global'], {
+    HELLOAGENTS_CLAUDE_CMD: join(home, 'missing-claude.cmd'),
+    HELLOAGENTS_GEMINI_CMD: join(home, 'missing-gemini.cmd'),
+  })
+
+  const settings = readJson(configFile)
+  assert.equal(settings.install_mode, 'global')
+  assert.equal(settings.host_install_modes.claude, undefined)
+  assert.equal(settings.host_install_modes.gemini, undefined)
+  assert.equal(settings.host_install_modes.codex, 'global')
+})
+
+test('all-host mode switch from global to standby removes native Claude and Gemini integrations before writing standby files', () => {
+  const { root: pkgRoot } = createPackageFixture()
+  const home = createHomeFixture()
+  const configFile = join(home, '.helloagents', 'helloagents.json')
+  const fakeBin = createTempDir('helloagents-mode-switch-bin-')
+  const claudeLog = join(home, 'claude-mode-switch.log')
+  const geminiLog = join(home, 'gemini-mode-switch.log')
+  const claudeMarketplaceRoot = getClaudeMarketplaceRoot(home)
+  const geminiExtensionRoot = getGeminiExtensionRoot(home)
+  const claudeCommand = writeFakeCommand(fakeBin, 'claude', claudeLog)
+  const geminiCommand = writeFakeCommand(fakeBin, 'gemini', geminiLog)
+  const testPath = `${fakeBin}${delimiter}${process.env.PATH || process.env.Path || ''}`
+  seedHostConfigs(home)
+
+  runCli(pkgRoot, home, ['--global'], {
+    PATH: testPath,
+    Path: testPath,
+    HELLOAGENTS_CLAUDE_CMD: claudeCommand,
+    HELLOAGENTS_GEMINI_CMD: geminiCommand,
+  })
+
+  runCli(pkgRoot, home, ['--standby'], {
+    PATH: testPath,
+    Path: testPath,
+    HELLOAGENTS_CLAUDE_CMD: claudeCommand,
+    HELLOAGENTS_GEMINI_CMD: geminiCommand,
+  })
+
+  const settings = readJson(configFile)
+  assert.equal(settings.install_mode, 'standby')
+  assert.equal(settings.host_install_modes.claude, 'standby')
+  assert.equal(settings.host_install_modes.gemini, 'standby')
+  assert.equal(settings.host_install_modes.codex, 'standby')
+  assert.ok(existsSync(join(home, '.claude', 'helloagents')))
+  assert.ok(existsSync(join(home, '.gemini', 'helloagents')))
+  assert.match(readText(claudeLog), /plugin marketplace add .*host-projections[\\/]+claude-marketplace/)
+  assert.match(readText(claudeLog), /plugin install helloagents@helloagents --scope user/)
+  assert.match(readText(claudeLog), /plugin remove helloagents/)
+  assert.match(readText(geminiLog), /extensions link .*host-projections[\\/]+gemini/)
+  assert.match(readText(geminiLog), /extensions uninstall helloagents/)
+  assert.ok(!existsSync(claudeMarketplaceRoot))
+  assert.ok(!existsSync(geminiExtensionRoot))
+  assert.ok(!existsSync(join(home, '.helloagents', 'helloagents', 'hooks', 'hooks.json')))
 })

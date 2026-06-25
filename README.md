@@ -8,12 +8,13 @@
 
 **A workflow layer for AI coding CLIs: skills, project knowledge, delivery checks, safer config writes, and resumable execution.**
 
-[![Version](https://img.shields.io/badge/version-3.1.1-orange.svg)](./package.json)
+[![Version](https://img.shields.io/badge/version-3.1.5-orange.svg)](./package.json)
 [![npm](https://img.shields.io/npm/v/helloagents.svg)](https://www.npmjs.com/package/helloagents)
 [![Node](https://img.shields.io/badge/node-%3E%3D18-339933.svg)](./package.json)
 [![Skills](https://img.shields.io/badge/skills-14-6366f1.svg)](./skills)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE.md)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/hellowind777/helloagents/issues)
+[![LINUX DO](https://img.shields.io/badge/LINUX_DO-recognized-0A84FF?logo=linux&logoColor=white)](https://linux.do)
 
 </div>
 
@@ -21,11 +22,12 @@
   <a href="./README.md"><img src="https://img.shields.io/badge/English-blue?style=for-the-badge" alt="English"></a>
   <a href="./README_CN.md"><img src="https://img.shields.io/badge/简体中文-blue?style=for-the-badge" alt="简体中文"></a>
 </p>
-
 ---
 
 > [!IMPORTANT]
 > Looking for `v2.x`? The old Python line now lives in [helloagents-archive](https://github.com/hellowind777/helloagents-archive). The `v3` line is a full rewrite based on Node.js, Markdown rules, skills, and small runtime scripts.
+
+> 🏅 This project is linked & recognized by the [LINUX DO](https://linux.do) community.
 
 ## Contents
 
@@ -45,9 +47,9 @@
 
 ## What HelloAGENTS Does
 
-AI coding CLIs can move fast, but they can also stop at advice, skip checks, lose project context, or report completion before the work is really done.
+AI coding CLIs can move fast, but they can also stop at advice, skip checks, lose project context, shift responsibility when tasks get hard, or report completion before the work is really done.
 
-HelloAGENTS adds a workflow layer on top of Claude Code, Gemini CLI, and Codex CLI. It helps the agent choose the right path, use task-specific quality skills, keep a project knowledge base, and verify work before delivery.
+HelloAGENTS adds a workflow layer on top of Claude Code, Gemini CLI, and Codex CLI. It anchors the agent as a capable executor, blocks responsibility-shifting patterns, helps the agent choose the right path, use task-specific quality skills, keep a project knowledge base, and verify work before delivery.
 
 <table>
 <tr>
@@ -71,6 +73,7 @@ HelloAGENTS adds a workflow layer on top of Claude Code, Gemini CLI, and Codex C
 | Problem | Without HelloAGENTS | With HelloAGENTS |
 |---------|---------------------|------------------|
 | Stops too early | Ends with suggestions | Continues into build, verify, and closeout |
+| Shifts responsibility | Refuses hard tasks, suggests other tools | Exhausts alternative paths, stays on task |
 | Quality is inconsistent | Depends on each prompt | 14 quality skills activate by task type |
 | Context is scattered | Plans live in chat history | Project knowledge and plan files stay on disk |
 | Completion is vague | Natural language says “done” | Delivery checks use state, evidence, and verification |
@@ -110,6 +113,7 @@ Commands run inside the AI CLI chat with a `~` prefix. The command skill is read
 | Command | Purpose |
 |---------|---------|
 | `~idea` | Lightweight exploration and option comparison; does not write files |
+| `~office` | Worth/scope review before planning; decides whether to do it, how big, and what the smallest wedge is |
 | `~auto` | Chooses the main path and keeps going until delivery or a real blocker |
 | `~plan` | Requirements, solution design, task breakdown, and plan package |
 | `~build` | Implementation from the current request or an existing plan |
@@ -127,6 +131,8 @@ Compatibility aliases:
 - `~do` → `~build`
 - `~design` → `~plan`
 - `~review` → `~qa`
+
+Use `~idea` when you want to compare approaches. Use `~office` when you first need to decide whether the work is worth doing at all, how big it should be, and what the smallest wedge is.
 
 ### 3) Project knowledge base
 
@@ -174,7 +180,7 @@ For `~prd`, HelloAGENTS also creates PRD files such as:
 - `prd/11-legal-privacy.md`
 - `prd/12-timeline.md`
 
-`contract.json` is used by the workflow to decide verification scope, reviewer/tester focus, optional advisor checks, and optional visual validation.
+`contract.json` is used by the workflow to decide `qaMode`, `qaFocus`, optional advisor checks, and optional visual validation.
 
 `tasks.md` also includes a Codex `/goal` entry. For long-running Codex work, use that prepared entry instead of giving `/goal` a raw product document. The default chain is `/goal -> ~auto -> ~qa`: Codex keeps the long-running continuation, `~auto` executes the AFK work, and `~qa` remains the final quality gate before closeout.
 
@@ -228,7 +234,9 @@ The CLI manages host files explicitly:
 - `doctor` reports drift in carriers, links, hooks, config entries, plugin roots, cache copies, versions, and real Claude/Gemini global install artifacts; for Codex, it also surfaces native `codex doctor` output when available
 - Codex managed `notify = ["helloagents-js", "codex-notify"]` stays portable, and `doctor`, `cleanup`, and `uninstall` also recognize wrapped `--previous-notify` chains used by Codex App / Computer Use
 - per-host mode tracking is written only after host setup succeeds, and failed native global cleanup keeps the host tracked as `global` instead of silently layering standby on top
+- direct `switch-branch` clears stale `HELLOAGENTS*` lifecycle env before its internal npm install/sync steps, and package `preuninstall` falls back to `--all` when no explicit host args are provided, so stale shell env does not shrink branch-switch or uninstall cleanup scope
 - Windows `.cmd` / `.bat` lifecycle calls now run through an explicit command wrapper, so host installs, branch switching, and doctor flows do not emit Node `DEP0190` shell deprecation warnings
+- Claude Code, Gemini CLI, and Codex CLI config writes, updates, cleanup, uninstall, mode switching, and branch switching are covered as one tested lifecycle chain instead of separate best-effort paths
 
 ## Quick Start
 
@@ -426,6 +434,8 @@ helloagents switch-branch beta claude --global
 helloagents branch beta --all --standby
 ```
 
+The direct `helloagents switch-branch ...` command also clears stale `HELLOAGENTS*` lifecycle env before its internal npm install and host-sync steps.
+
 Use normal npm commands when you only want to change the package and not sync host CLIs immediately:
 
 ```bash
@@ -472,6 +482,7 @@ Codex global mode is installed by HelloAGENTS automatically through the local-pl
 | Goal | Use |
 |------|-----|
 | Compare ideas before writing files | `~idea "compare two API designs"` |
+| Decide whether something is worth doing and how small to start | `~office "should this become a full platform or just a thin wedge?"` |
 | Let HelloAGENTS choose the path and continue | `~auto "add JWT login"` |
 | Review a plan before implementation | `~plan "refactor payment module"` |
 | Implement from a clear request or active plan | `~build "finish task 2 in the plan"` |
@@ -542,17 +553,20 @@ Once the task creates or modifies local files, or otherwise leaves local output 
 HelloAGENTS uses this stage model for structured work:
 
 ```text
-ROUTE / TIER → SPEC → PLAN → BUILD → QA → CONSOLIDATE
+Routing and tiering → Goal clarification → Planning → Implementation → Quality loop → Closeout and archive
 ```
 
 | Stage | Purpose |
 |-------|---------|
-| `ROUTE / TIER` | decide whether the task is idea, plan, build, verify, PRD, or automatic flow |
-| `SPEC` | clarify goal, constraints, and success criteria |
-| `PLAN` | prepare plan files and choose needed skills |
-| `BUILD` | implement and run local checks |
-| `QA` | review, run commands, check contract and evidence |
-| `CONSOLIDATE` | update state, knowledge, and closeout evidence |
+| `Routing and tiering` | decide whether the task should go through `~idea`, `~office`, `~plan`, `~build`, `~qa`, `~prd`, or automatic flow |
+| `Goal clarification` | clarify goal, constraints, and success criteria |
+| `Planning` | prepare plan files and choose needed skills |
+| `Implementation` | implement and run local checks |
+| `Quality loop` | review, run commands, and check contract and evidence |
+| `Closeout and archive` | update state, knowledge, and closeout evidence |
+
+HelloAGENTS also keeps an always-on core-rule layer in `bootstrap.md` / `bootstrap-lite.md`.
+That layer anchors the agent as a capable executor in a trusted environment, blocks responsibility-shifting to users or other tools, enforces exhausting alternative paths before declaring blockage, corrects proposal bias, distinguishes real external constraints from internal inertia, and keeps user-visible wording in one language unless code identifiers, commands, paths, config keys, or necessary proper names must stay unchanged.
 
 ### Delivery tiers
 
@@ -681,6 +695,7 @@ npm test
 The current suite covers:
 
 - install, update, cleanup, uninstall, branch switching, and mode switching
+- stale lifecycle-env protection for direct `switch-branch` and package `preuninstall`
 - Windows `.cmd` / `.bat` lifecycle dispatch without Node `DEP0190` warnings
 - one-shot shell and PowerShell lifecycle dispatch, plus wrapper env cleanup and mode-routing rules for install, update, cleanup, uninstall, and branch switching
 - Claude, Gemini, and Codex host integration behavior, including global-to-standby cleanup and failed native cleanup tracking
@@ -691,6 +706,7 @@ The current suite covers:
 - project storage and `repo-shared` behavior
 - workspace-session scoped `state_path`, runtime signals, and evidence
 - runtime injection, routing, guard, verification, visual evidence, delivery gates, closeout de-duplication, sub-agent wrapper and notification suppression, and successful-mode tracking after native install failures
+- end-to-end host config write, update, cleanup, uninstall, mode-switch, and branch-switch flows across Claude Code, Gemini CLI, and Codex CLI
 - README and skill contract alignment
 
 ## FAQ
